@@ -1602,8 +1602,8 @@ def rule_guitar(shape):
 #   keyboard     slab         PC3       third moment     64%        58 deg
 #   lamp         revolution   rot axis  wide end up      57%        13 deg
 #   monitor      upright      tallest   wide end up      42%        19 deg
-#   piano        upright      plate     support          50%        64 deg
-#   toilet       upright      plate     top_is_shorter   36%        62 deg
+#   piano        (own)        PC3|PC2   support          68%        -- see rule_piano
+#   toilet       (own)        profile   wide end up      65%        -- see rule_toilet
 #   wardrobe     upright      tallest   top_is_shorter    8%       104 deg
 #
 # door, flower_pot, lamp and keyboard work.  bathtub, bench, monitor and piano
@@ -1915,10 +1915,60 @@ def rule_monitor(shape):
 
 
 def rule_piano(shape):
-    """The lid plate gives up and support signs it (50%).  The keyboard end
-    should give forward and does not reliably -- an upright and a grand put
-    their mass in different places, and the two shapes share a class."""
-    return upright_frame(shape, "plate", "support")
+    """Two shapes share this class, so the rule first tells them apart.
+
+    A grand stands on three legs under a flat case, so the low end of its
+    thinnest principal axis is sparse and wide: support_score along PC3 is
+    2.5-7.7 times its value along the other two axes on every grand measured,
+    and about 1 on uprights.  A grand therefore takes up from PC3, signed by
+    support, and forward along PC1 towards the wide keyboard end; the tail
+    tapers.  best_mirror is not used for it: a grand's curved side leaves it
+    without a left-right mirror, and the plane found instead scattered
+    forward across the class.
+
+    An upright is a box standing on end: PC1 runs across the keyboard, up is
+    PC2, signed by support (the keyboard brackets), and forward is the thin
+    PC3.  Taken from the inertia tensor rather than best_mirror for the same
+    reason as rule_sofa: through the mirror, two near-cubic instances wandered
+    60-80 deg between poses of the same cloud.
+
+    Measured on 25 instances against the stored z-up, the old rule (lid plate,
+    support) put up within 15 deg on 10 and lost nearly every upright, which
+    it laid on its back.  This puts 17 within 15 deg; stability 6.1 -> 0.0
+    deg, consistency median 94 -> 40 deg, RMS 98 -> 82.  Forward is still the
+    weak part: the grands agree with each other, the uprights less so.
+
+    Support alone mistook two uprights for grands: an upright lying on its
+    back also has a sparse, wide low end (the keyboard and its brackets).
+    What legs add is empty space: under a grand the lowest 30% of the height
+    holds under 5.5% of the points (0-5% on every grand but one), an
+    upright's keyboard end holds 6-18%.  Requiring both sorts 28/30 correctly
+    and takes consistency RMS 81 -> 76 deg on all 30, with the even half
+    improving (82 -> 73) and the odd half unchanged.
+
+    Measured and rejected, so nobody repeats them: reference snapping (RMS
+    84-97 with 0-3 clusters); forward from the top-view bounding rectangle
+    (more often semantically right -- the dataset stores grands 6, 12, 21 and
+    26 turned 90 deg -- but it scores worse against the stored poses); a
+    majority vote of support/floor/third for the upright sign (fixes 7,
+    breaks 16); choosing the upright's up between PC1 and PC2 by support,
+    floor or the mirror (11/14 each, the same as PC2 alone)."""
+    X, V = shape.X, shape.V
+    sup = [max(support_score(X, V[:, i]), support_score(X, -V[:, i])) for i in range(3)]
+    up = unit(V[:, 2])
+    if support_score(X, up) < support_score(X, -up):
+        up = -up
+    h = X @ up                                     # legs leave the low 30% nearly empty
+    legs = float(np.mean(h <= h.min() + 0.30 * np.ptp(h))) < 0.055
+    if sup[2] < 2.2 * max(sup[:2]) or not legs:    # no legs under the case: upright
+        R, info = slab_frame(shape, up_axis=1, fwd_axis=2, up_sign="support")
+        return R, dict(info, symmetry="I")        # a piano has no half-turn
+
+    fwd = unit(V[:, 0])
+    lo, hi = end_spread(X, fwd)                    # keyboard end is wide, tail tapers
+    if lo > hi:
+        fwd = -fwd
+    return frame_from(fwd, up), {"up_cue": "grand_legs", "symmetry": "I"}
 
 
 def rule_toilet(shape):
@@ -1951,9 +2001,46 @@ def rule_toilet(shape):
     it looks like when a class has no single geometry: a toilet's height and
     its depth are within 15% of each other, so nothing separates up from
     forward by size, and the cistern is present on some models and absent on
-    others.  The rule below is the best of them and it is still wrong more
-    often than right.  Do not quote this class."""
-    return upright_frame(shape, "plate", "top_short")
+    others.  None of them was better than wrong more often than right.
+
+    What does work is the side profile's bounding rectangle (below): the axis
+    that best reads as a support is up, the wide end (bowl rim, not the
+    pedestal) signs it, and the empty top-front corner gives forward.  Up
+    within 15 deg on 13/20, up from 6/20; consistency median 64 -> 5 deg,
+    within 10 deg 20% -> 55%.  The seven still wrong are the boxy models with
+    the bowl hidden inside a skirt, whose profile has no empty corner to read.
+
+    Measured and rejected for the choice of up edge and its sign: tallest,
+    shortest, plate, end plate and floor against support, with every UP_SIGN
+    -- the lowest-RMS of those put up right on 0-2 of 20, agreeing only by
+    being uniformly wrong.  The same empty-corner forward on upright pianos
+    made them worse (RMS 76 -> 96)."""
+    X = shape.X
+    lat, mscore = best_mirror(shape)
+
+    # The mirror plane is right on all twenty; what failed was up inside it,
+    # which sits diagonally between the principal axes of the L-shaped side
+    # profile.  The tightest rectangle around that profile has its edges on
+    # the floor and the back wall: one edge is within 15 deg of up on 18/20.
+    a, _ = _circle_argmax(X, lat, lambda d: -float(np.ptp(X @ d) * np.ptp(X @ np.cross(lat, d))))
+    b = unit(np.cross(lat, a))
+    up = max((a, b), key=lambda d: max(support_score(X, d), support_score(X, -d)))
+    if not _sign_wide_up(X, up):                   # bowl rim wider than the pedestal
+        up = -up
+
+    # Forward from the empty corner of the profile: above the bowl and in
+    # front of the cistern.  The crown test (cistern mean behind) flipped the
+    # boxy models, whose top slice is the lid as much as the cistern; counting
+    # which half of the top is emptier takes consistency RMS 101 -> 85 deg and
+    # the median 13 -> 5, better on both odd and even halves.
+    fwd = unit(np.cross(lat, up))
+    h = X @ up
+    f = X @ fwd
+    top = h > np.median(h)
+    if np.sum(top & (f > np.median(f))) > np.sum(top & (f < np.median(f))):
+        fwd = -fwd
+    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": "profile_box",
+                                 "symmetry": "I"}
 
 
 def rule_wardrobe(shape):
