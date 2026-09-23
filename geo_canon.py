@@ -35,6 +35,7 @@ import json
 import math
 import re
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -70,7 +71,8 @@ SYNSET_TO_CLASS = {
 CLASS_ORDER = ["airplane", "car", "chair", "table", "bowl",
                "laptop", "bed", "bottle", "guitar", "sofa",
                "bathtub", "bench", "bookshelf", "door", "flower_pot",
-               "keyboard", "lamp", "monitor", "piano", "toilet", "wardrobe"]
+               "keyboard", "lamp", "monitor", "piano", "toilet", "wardrobe",
+               "cone", "sink", "stool", "vase"]
 
 # Symmetry group of each class in CANONICAL coordinates (z = up, x = forward).
 # "I"     : trivial, the frame is fully determined
@@ -99,6 +101,10 @@ DEFAULT_SYMMETRY = {
     "piano": "I",
     "toilet": "I",
     "wardrobe": "I",
+    "cone": "Cinfz",
+    "sink": "I",
+    "stool": "I",
+    "vase": "Cinfz",
 }
 
 SIGMA_MATCH = 0.05      # tolerance of the symmetry matching kernel (cloud has rms radius 1)
@@ -112,6 +118,7 @@ PARTIAL_MIRROR = False  # let the mirror plane leave the centroid.  Correct for
                         # map one wing of an aircraft onto the other -- so it is
                         # off by default and exposed as --partial-mirror
 EPS = 1e-12
+RULESET_VERSION = 2
 
 
 # ----------------------------------------------------------------------------
@@ -889,6 +896,106 @@ def end_spread(X, d, frac=0.16):
             float(b.mean()) if len(b) else 0.0)
 
 
+def end_profile_vote(X, axis, bands=(0.16, 0.24, 0.32)):
+    """Vote for the narrower end (+axis positive), with a dimensionless margin.
+
+    Robust extents and several spatial bands tolerate stabilisers/handles that
+    sit inward of the tip. Median aggregation prevents one band dominating.
+    The returned confidence measures agreement/strength, not a probability.
+    """
+    axis = unit(axis)
+    t = X @ axis
+    lo, hi = np.quantile(t, [0.01, 0.99])
+    radius = np.linalg.norm(X - np.outer(t, axis), axis=1)
+    votes = []
+    for band in bands:
+        a = radius[t <= lo + band * (hi - lo)]
+        b = radius[t >= hi - band * (hi - lo)]
+        if min(len(a), len(b)) >= 8:
+            ra, rb = np.quantile(a, 0.8), np.quantile(b, 0.8)
+            votes.append(float((ra - rb) / max(ra + rb, EPS)))
+    vote = float(np.median(votes)) if votes else 0.0
+    return vote, abs(vote)
+
+
+def crown_direction(X, up, forward, plate_height=None):
+    """Point away from a back/headboard using several height bands.
+
+    Offsets are relative to the footprint centre, not the sampling centroid.
+    When available, the seat/mattress height excludes the platform itself.
+    """
+    h, t = X @ up, X @ forward
+    lo, hi = np.quantile(t, [0.02, 0.98])
+    middle, extent = (lo + hi) / 2, max(hi - lo, EPS)
+    offsets = []
+    for q in (0.72, 0.82, 0.90):
+        cutoff = float(np.quantile(h, q))
+        if plate_height is not None:
+            cutoff = max(cutoff, plate_height + 0.08 * np.ptp(h))
+        crown = t[h > cutoff]
+        if len(crown) >= 8:
+            offsets.append(float((np.median(crown) - middle) / extent))
+    offset = float(np.median(offsets)) if offsets else 0.0
+    return (forward if offset <= 0 else -forward), min(1.0, 2 * abs(offset))
+
+
+def upper_structure_vote(X, up, forward=None):
+    """A headboard/cabin occupies less length than the platform below it.
+
+    Spatial bands avoid a dense mattress consuming an entire quantile band.
+    Measure spans about each band, so an off-centre headboard is still narrow.
+    """
+    long_axis = forward
+    if long_axis is None:
+        long_axis, _, _, _ = _plane_pca_axes(X, up)
+    h, t = X @ up, X @ long_axis
+    lo, hi = np.quantile(h, [0.01, 0.99])
+    votes = []
+    for band in (0.12, 0.20, 0.28):
+        bottom, top = t[h <= lo + band * (hi - lo)], t[h >= hi - band * (hi - lo)]
+        if min(len(bottom), len(top)) >= 8:
+            a = float(np.diff(np.quantile(bottom, [0.05, 0.95]))[0])
+            b = float(np.diff(np.quantile(top, [0.05, 0.95]))[0])
+            votes.append((a - b) / max(a + b, EPS))
+    return float(np.median(votes)) if votes else 0.0
+
+
+def stabiliser_vote(X, forward, lateral):
+    """Locate a smaller span lobe separated from the main wings.
+
+    End widths alone fail on short-nosed propeller planes: the main wing can
+    enter the nose band. Exclude the main-wing neighbourhood before looking
+    for a secondary horizontal surface. A strong fin cue takes precedence
+    for canards, whose smaller horizontal surface is at the front.
+    """
+    t, radius = X @ forward, np.abs(X @ lateral)
+    lo, hi = np.quantile(t, [0.01, 0.99])
+    edges = np.linspace(lo, hi, 21)
+    centres = (edges[1:] + edges[:-1]) / 2
+    widths = np.zeros(20)
+    for i in range(20):
+        # Symmetric inclusion of boundary points matters for meshes with many
+        # coplanar samples: reversing an unsigned axis must reverse the vote.
+        values = radius[np.abs(t - centres[i]) <= (edges[i + 1] - edges[i]) / 2 + 1e-10]
+        if len(values) >= 8:
+            widths[i] = np.quantile(values, 0.90)
+    wings = float(widths.max())
+    if wings <= EPS:
+        return 0.0, 0.0
+    main = widths >= 0.9 * wings
+    wing_centre = float(np.average(centres[main], weights=widths[main]))
+    separated = np.abs(centres - wing_centre) > 0.25 * (hi - lo)
+    ends = []
+    for low in (True, False):
+        mask = separated & ((centres < (lo + hi) / 2) if low else
+                            (centres > (lo + hi) / 2))
+        ends.append(float(np.max(widths[mask])) if mask.any() else 0.0)
+    margin = (ends[0] - ends[1]) / max(sum(ends), EPS)
+    if max(ends) < 0.20 * wings:
+        return 0.0, 0.0
+    return margin, abs(margin)
+
+
 def plane_normal_of_slab(X, d, centre, width=0.09):
     """Refit a plate's normal from the points inside its slab.  Continuous in
     the data, which is what keeps the estimator equivariant."""
@@ -947,11 +1054,25 @@ def _circle_argmax(X, n, fn, n_samples=180, refine=3):
 
 
 def rule_airplane(shape):
-    """Mirror plane normal is the wing span.  Inside that plane the long axis is
-    the fuselage and the short one is vertical.  The nose is the blunt-free end
-    (small perpendicular spread); the fin fixes which way is up."""
+    """Use bilateral wings, their plane, then dorsal fin and end profiles.
+
+    The fin is read before choosing the nose: choosing a tail from one narrow
+    end slice first makes a missed stabiliser invert BOTH semantic signs.
+    Outer wings provide a fallback plane and a datum for fin protrusions.
+    Flying wings without a fin fall back to multi-scale end profiles; weak
+    evidence is exposed in metadata, never promoted to rotational symmetry.
+    """
     X = shape.X
     span, mscore = best_mirror(shape)
+    # A nearly flat aircraft also reflects across its wing plane. Trimming
+    # away the fin can make that the winning mirror. The lateral direction
+    # must carry appreciably more variance than the thin direction.
+    cands = np.vstack([span, shape.cands])
+    cands = [d for d in cands if np.mean((X @ d) ** 2) > 2 * shape.w[-1]]
+    if cands:
+        scores = shape.mirror_score(cands, trim=1.0)
+        span = unit(cands[int(np.argmax(scores))])
+        mscore = float(np.max(scores))
     got = plate_axis(X, span, min_frac=0.12)      # the wing sheet fixes the roll
     if got is not None:
         up = got[0]
@@ -961,20 +1082,86 @@ def rule_airplane(shape):
         fwd, up, _, _ = _plane_pca_axes(X, span)
         cue = "plane_pca"
 
-    lo, hi = end_spread(X, fwd)                   # tail carries the stabilisers
-    if lo < hi:
-        fwd = -fwd                                # nose at the low end -> flip
-    t = X @ fwd                                   # fin cue inside the tail region
-    tail = X[t <= np.quantile(t, 0.25)]
-    if len(tail) > 10:
-        s_ = tail @ up
-        if abs(s_.max()) < abs(s_.min()):
-            up = -up
+    lateral = np.abs(X @ span)
+    wings = X[lateral >= np.quantile(lateral, 0.65)]
+    W = wings - wings.mean(0)
+    w, V = np.linalg.eigh(W.T @ W / len(W))
+    if got is None and w[0] < 0.12 * max(w[1], EPS):
+        normal = V[:, 0] - (V[:, 0] @ span) * span
+        up = unit(normal)
+        fwd = unit(np.cross(span, up))
+        cue = "outer_wing_plane"
+    h = X @ up
+    t = X @ fwd
+    lo, hi = np.quantile(t, [0.01, 0.99])
+    length = max(hi - lo, EPS)
+    centreline = lateral < 0.25 * np.quantile(lateral, 0.98)
+    fin_heights = []
+    for at_high in (False, True):
+        heights = []
+        for band in (0.22, 0.32, 0.42):
+            end = t >= hi - band * length if at_high else t <= lo + band * length
+            values = h[end & centreline]
+            if len(values) >= 12:
+                q = np.quantile(values, [0.05, 0.5, 0.95])
+                # Asymmetric vertical extension rejects a thick, round nose.
+                heights.append(float(abs(q[2] + q[0] - 2 * q[1])))
+        fin_heights.append(float(np.median(heights)) if heights else 0.0)
+    fin_margin = (fin_heights[0] - fin_heights[1]) / max(sum(fin_heights), EPS)
+    stabiliser, stabiliser_conf = stabiliser_vote(X, fwd, span)
+    # Also search away from the tips: twin fins need not be on the centreline,
+    # and a long aft boom can put all stabilisers inside the end bands.
+    wing_h = float(np.median(wings @ up))
+    residual = h - wing_h
+    low, high = np.quantile(residual, [0.02, 0.98])
+    dorsal_sign = 1.0 if high >= -low else -1.0
+    dorsal_margin = abs(high + low) / max(high - low, EPS)
+    dorsal = residual * dorsal_sign
+    fin = dorsal > max(0.55 * np.quantile(dorsal, 0.98), 0.05 * length)
+    wing_t = float(np.median(wings @ fwd))
+    fin_offset = float(np.median(t[fin]) - wing_t) if fin.sum() >= 8 else 0.0
+    fin_is_local = (fin.sum() >= 8 and float(np.quantile(lateral[fin], 0.9)) <
+                    0.75 * float(np.quantile(lateral, 0.98)))
+    wing_chord = float(np.diff(np.quantile(wings @ fwd, [0.1, 0.9]))[0])
+    dorsal_found = (dorsal_margin > 0.55 and fin_is_local and
+                    abs(fin_offset) > max(0.03 * length, 0.5 * wing_chord))
+    if dorsal_found:
+        fwd = fwd if fin_offset < 0 else -fwd
+        forward_conf = dorsal_margin
+        forward_cue = "dorsal_protrusion"
+    elif max(fin_heights) > 0.035 * length and abs(fin_margin) > 0.55:
+        fwd = fwd if fin_margin > 0 else -fwd
+        forward_conf = abs(fin_margin)
+        forward_cue = "end_fin_profile"
+    elif stabiliser_conf > 0.35:
+        fwd = fwd if stabiliser >= 0 else -fwd
+        forward_conf = stabiliser_conf
+        forward_cue = "secondary_wing_lobe"
     else:
-        s_ = X @ up
-        if abs(np.quantile(s_, 0.99)) < abs(np.quantile(s_, 0.01)):
-            up = -up
+        vote, forward_conf = end_profile_vote(X, fwd)
+        fwd = fwd if vote >= 0 else -fwd
+        forward_cue = "multi_scale_end_profile"
+    # Sign up only after identifying the tail, relative to its own fuselage
+    # median. This tolerates high/low wings and pitched wing sheets.
+    t = X @ fwd
+    tail = h[(t <= np.quantile(t, 0.28)) & centreline]
+    if len(tail) < 12:
+        tail = h[t <= np.quantile(t, 0.28)]
+    q = np.quantile(tail, [0.03, 0.5, 0.97])
+    up_vote = float(q[2] + q[0] - 2 * q[1])
+    up_conf = abs(up_vote) / max(q[2] - q[0], EPS)
+    if up_conf < 0.18:
+        # With no clearly resolved fin skew, use the tail's robust extent
+        # about the cloud centre, retaining a low confidence.
+        up_vote = float(q[2] + q[0])
+    if dorsal_found:
+        up_vote, up_conf = dorsal_sign, dorsal_margin
+    if up_vote < 0:
+        up = -up
     return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
+                                 "forward_cue": forward_cue,
+                                 "up_confidence": float(up_conf),
+                                 "forward_confidence": float(forward_conf),
                                  "symmetry": "I"}
 
 
@@ -1102,23 +1289,24 @@ def rule_chair(shape):
                                  "symmetry": "I"}
 
 
-def detect_axial_symmetry(shape, up, allow=("C2z", "C4z", "Cinfz")):
+def detect_axial_symmetry(shape, up, allow=("C2z", "C4z", "Cinfz"), min_score=0.0):
     """Measure, rather than assume, the rotational symmetry about the up axis.
 
     A generic angle gives the chance level of the matching score for this cloud,
     which is what the candidate symmetries are compared against.  Only the
     symmetries the class can actually have are tested, so a car is never granted
-    a 180 degree ambiguity just because its body is roughly a box."""
+    a 180 degree ambiguity just because its body is roughly a box. min_score
+    optionally requires an absolute match as well as the relative margin."""
     generic = float(np.mean([shape.rot_score(up, angles=(a,))
                              for a in (0.77, 1.31, 2.21)]))
     s180 = shape.rot_score(up, angles=(np.pi,))
     s90 = shape.rot_score(up, angles=(np.pi / 2,))
     sc = {"generic": generic, "s180": s180, "s90": s90}
-    if "Cinfz" in allow and generic >= 0.85 * max(s180, s90) and s180 > 1e-6:
+    if "Cinfz" in allow and generic >= max(min_score, 0.85 * max(s180, s90)) and s180 > 1e-6:
         return "Cinfz", sc
-    if "C4z" in allow and s90 >= 0.90 * s180 and s180 >= 1.25 * generic:
+    if "C4z" in allow and s90 >= max(min_score, 0.90 * s180) and s180 >= 1.25 * generic:
         return "C4z", sc
-    if "C2z" in allow and s180 >= 1.30 * generic:
+    if "C2z" in allow and s180 >= max(min_score, 1.30 * generic):
         return "C2z", sc
     return "I", sc
 
@@ -1277,7 +1465,8 @@ def rule_bed(shape):
     rule_chair's situation exactly.  up comes from the platform plate rather
     than from support, for the reason rule_laptop documents: support rewards
     the widest footprint, not the surface the object actually rests on.
-    Support is left to fix the sign.
+    Spatial end bands sign up toward the short headboard rather than the
+    full-length underside; support mass alone often inverts a solid bed base.
     """
     X = shape.X
     lat, mscore = best_mirror(shape)
@@ -1289,18 +1478,18 @@ def rule_bed(shape):
     else:
         up, cue = got[0], "plate"
     up = unit(up - (up @ lat) * lat)
-    if support_score(X, up) < support_score(X, -up):
+    up_vote = upper_structure_vote(X, up)
+    if up_vote < 0:
         up = -up
 
     fwd = unit(np.cross(lat, up))
     # The headboard is the top slice, not merely the upper half: a bed is
     # mostly mattress, so a median split is dominated by the platform and the
     # sign it returns is close to a coin toss.
-    h = X @ up
-    crown = X[h >= float(np.percentile(h, 72))]
-    if len(crown) > 10 and float((crown @ fwd).mean()) > 0:
-        fwd = -fwd
+    fwd, confidence = crown_direction(X, up, fwd)
     return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
+                                 "forward_confidence": confidence,
+                                 "up_confidence": abs(up_vote),
                                  "symmetry": "I"}
 
 
@@ -1533,6 +1722,8 @@ def revolution_frame(shape, wide_end_up=True):
     j = 0 if k != 0 else 1                         # any equivariant in-plane seed
     seed = shape.V[:, j] - (shape.V[:, j] @ up) * up
     fwd = unit(seed) if np.linalg.norm(seed) > 1e-6 else complement(up)[0]
+    if float(np.mean((X @ fwd) ** 3)) < 0:
+        fwd = -fwd
     return frame_from(fwd, up), {"rot_score": float(scores.max()),
                                  "symmetry": sym, "sym_scores": sd}
 
@@ -1548,34 +1739,72 @@ def slab_frame(shape, up_axis=0, fwd_axis=2, up_sign="third"):
     if not UP_SIGNS[up_sign](X, up):
         up = -up
     fwd = unit(fwd - (fwd @ up) * up)
+    # An eigensolver's eigenvector sign is not a geometric face cue. Fix it
+    # explicitly so an asymmetric panel remains stable when C2z is rejected.
+    if float(np.mean((X @ fwd) ** 3)) < 0:
+        fwd = -fwd
     return frame_from(fwd, up), {"symmetry": "C2z"}
 
 
 def rule_bathtub(shape):
-    """A tub is a bowl with a mirror plane: the rim is the wide end and it
-    points up.  Every cue that reads width as a footprint -- support, floor,
-    taper -- lands it upside down (155 deg out), because the open rim is
-    exactly what they reward; reversing the taper fixes it (up<15 on 25%)."""
-    return upright_frame(shape, "plate", "wide_up")
+    """An elongated open basin: closed floor below, open rim above.
+
+    Evaluate both signs of candidate normals using central coverage of the
+    end slabs. A side wall cannot win merely because it is a large plate:
+    the opposite end must actually have an opening. Works for sinks too.
+    """
+    X = shape.X
+    candidates = list(shape.V.T)
+    for d in shape.V.T:
+        _, centre, _ = slab_peak(X, d, width=0.10)
+        normal, flat = plane_normal_of_slab(X, d, centre, width=0.13)
+        if flat > 0.85:
+            candidates.append(normal)
+    best = (-np.inf, None)
+    for axis in candidates:
+        for up in (axis, -axis):
+            t = X @ up
+            lo, hi = np.quantile(t, [0.01, 0.99])
+            a, b, _, _ = _plane_pca_axes(X, up)
+            P = np.column_stack([X @ a, X @ b])
+            bounds = np.quantile(P, [0.02, 0.98], axis=0)
+            Q = (P - bounds.mean(0)) / np.maximum(np.diff(bounds, axis=0)[0] / 2, EPS)
+            central = np.max(np.abs(Q), axis=1) < 0.55
+            votes = []
+            for band in (0.12, 0.22, 0.32):
+                bottom = t <= lo + band * (hi - lo)
+                top = t >= hi - band * (hi - lo)
+                if min(bottom.sum(), top.sum()) >= 12:
+                    votes.append(float(central[bottom].mean() - central[top].mean()))
+            score = float(np.median(votes)) if votes else -1.0
+            if score > best[0]:
+                best = (score, up)
+    confidence, up = best
+    fwd, _, _, _ = _plane_pca_axes(X, up)
+    fwd, front_conf = crown_direction(X, up, fwd)
+    sym, scores = detect_axial_symmetry(shape, up, allow=("C2z",), min_score=0.65)
+    return frame_from(fwd, up), {"up_cue": "closed_floor_open_rim",
+                                "up_confidence": max(0.0, float(confidence)),
+                                "forward_confidence": front_conf,
+                                "symmetry": sym, "sym_scores": scores}
 
 
 def rule_bench(shape):
-    """The seat plate gives up, support fixes the sign (58%), and the backrest
-    or armrest gives forward.  A backless bench has no forward cue at all,
-    which is where the 91 deg median azimuth comes from.
+    """Terminal or interior seat, support below, optional backrest above.
 
-    The class is not one shape: measured over twenty instances the long-to-mid
-    aspect ratio is 2.30 +- 0.91, against 1.43 +- 0.29 for chair, because
-    ModelNet files long backless planks and compact backed benches under the
-    same name.  A plank with slab legs is also unchanged by being turned over
-    -- its Chamfer distance to its own flip is 0.40 of a generic turn, against
-    0.75 for a chair, and on 65% of instances it is a real self-map -- so the
-    flip is tested per instance and reported as C2x when it holds.
-
-    Up comes from the sharpest plate rather than the interior one, which is
-    what a backless bench needs: 80% within 15 deg against 65%.  The azimuth
-    stays poor (80 deg) and no cue will fix it, because a plank has no front."""
-    return upright_frame(shape, "sharpest", "support", flip_symmetry=True)
+    Multiple crown bands sign forward when there is a back. A backless bench
+    may have a half-turn yaw symmetry, but a seat on legs is not generally
+    unchanged by turning it upside down. Require both a strong absolute
+    match and separation from generic rotations before reporting C2z.
+    """
+    R, info = upright_frame(shape, "sharpest", "support")
+    forward, confidence = crown_direction(shape.X, R[2], R[0])
+    R = frame_from(forward, R[2])
+    # Backless benches have a yaw ambiguity, not automatically an up/down
+    # ambiguity. Test the actual rotation instead of assigning it by label.
+    symmetry, scores = detect_axial_symmetry(shape, R[2], allow=("C2z",), min_score=0.65)
+    return R, dict(info, forward_confidence=confidence,
+                   symmetry=symmetry, sym_scores=scores)
 
 
 def rule_bookshelf(shape):
@@ -1621,7 +1850,23 @@ def flat_panel_frame(shape):
     Signing the long axis by the third moment rather than the foot costs the
     keyboard (74 deg against 27 deg).  A keyboard therefore canonicalises
     standing on its edge, which is the price of the two classes agreeing."""
-    return slab_frame(shape, up_axis=0, fwd_axis=2, up_sign="floor")
+    R, info = slab_frame(shape, up_axis=0, fwd_axis=2, up_sign="floor")
+    # Featureless slabs have three proper half-turns, not just yaw. A strong
+    # self-match is required on every generator and its product; this is a
+    # measured ambiguity, not permission to ignore a bad semantic sign.
+    scores = [float(shape.rot_score(axis, angles=(np.pi,))) for axis in R]
+    valid = [score >= 0.75 for score in scores]
+    if all(valid):
+        symmetry = "D2"
+    elif valid[2]:
+        symmetry = "C2z"
+    elif valid[0]:
+        symmetry = "C2x"
+    elif valid[1]:
+        symmetry = "C2y"
+    else:
+        symmetry = "I"
+    return R, dict(info, symmetry=symmetry, half_turn_scores=scores)
 
 
 def rule_door(shape):
@@ -1648,7 +1893,8 @@ def rule_keyboard(shape):
     stored orientation: surface roughness at each face 45%, denser face 55%,
     mass above the midplane 40%, base coverage 40%, sharper density peak 30%,
     third moment 60%.  Nothing clears 60% on twenty models, which is two
-    models away from a coin toss, and the sign is absorbed by C2z anyway."""
+    models away from a coin toss. Residual half-turns are now measured: a
+    featureless slab can be D2, while a resolved asymmetric panel can be I."""
     return flat_panel_frame(shape)
 
 
@@ -1724,6 +1970,49 @@ def rule_wardrobe(shape):
     return upright_frame(shape, "principal", "base", flip_symmetry=True)
 
 
+def rule_cone(shape):
+    """Axial solid: broad base below the apex, with measured yaw symmetry."""
+    return revolution_frame(shape, wide_end_up=False)
+
+
+def rule_vase(shape):
+    """Open vessel; the closed base fixes up even when the neck is narrow.
+
+    Width alone cannot distinguish a flared pot from a narrow-necked vase.
+    First find the rotational axis and refine against a terminal plate. Then
+    compare central coverage at each end using that end's OWN radius, so a
+    narrow neck is not mistaken for a filled base. Low confidence remains
+    explicit when neither end has enough interior samples.
+    """
+    R, info = revolution_frame(shape, wide_end_up=True)
+    X, up = shape.X, R[2]
+    _, centre, _ = slab_peak(X, up, width=0.06)
+    normal, flat = plane_normal_of_slab(X, up, centre, width=0.08)
+    if flat > 0.95 and normal @ up > np.cos(np.deg2rad(20)):
+        up = normal
+    h = X @ up
+    lo, hi = np.quantile(h, [0.01, 0.99])
+    radial = X - np.outer(h, up)
+    votes = []
+    for band in (0.06, 0.10, 0.16):
+        coverage = []
+        for mask in (h <= lo + band * (hi - lo), h >= hi - band * (hi - lo)):
+            points = radial[mask]
+            if len(points) < 12:
+                coverage.append(0.0)
+                continue
+            radius = np.linalg.norm(points - np.median(points, axis=0), axis=1)
+            coverage.append(float(np.mean(radius < 0.55 * np.quantile(radius, 0.90))))
+        votes.append(coverage[0] - coverage[1])
+    vote = float(np.median(votes))
+    if vote < 0:
+        up = -up
+    symmetry, scores = detect_axial_symmetry(shape, up, min_score=0.65)
+    return frame_from(R[0], up), dict(info, up_cue="local_end_closure",
+                                     up_confidence=abs(vote), symmetry=symmetry,
+                                     sym_scores=scores)
+
+
 def octahedral_rotations():
     """The 24 rotations that map the coordinate axes onto themselves.
 
@@ -1749,7 +2038,7 @@ OCTAHEDRAL = octahedral_rotations()
 # table or a bowl is symmetric about its own vertical, so several attitudes are
 # genuinely equivalent, the nearest-reference choice among them is arbitrary,
 # and forcing one costs accuracy instead of adding any.
-REFERENCE_CLASSES = ("airplane", "car", "chair")
+REFERENCE_CLASSES = ("airplane", "car", "chair", "bed", "bathtub")
 
 # How many shape clusters each class's reference is split into.  One means a
 # single ensemble, which is right for classes whose members look alike.
@@ -1771,13 +2060,11 @@ REFERENCE_CLASSES = ("airplane", "car", "chair")
 # borderline plane lands in different clusters for different input poses.  They
 # keep a single ensemble.
 CLUSTERS_PER_CLASS = {"chair": 4, "car": 4}
-# Chair is deliberately absent.  Measured on real ShapeNet, the reference made
-# chairs worse, not better: median error went from 14 to 64 degrees and the
-# share within 10 degrees from 44% to zero.  Chairs vary so much in shape that
-# each one snaps and tilts towards a different ensemble member, which scatters
-# the class instead of gathering it.  Planes and cars are uniform enough for the
-# same machinery to help.  Override with --reference-classes.
-REFINE_CLASSES = ("airplane", "car", "chair")
+# Bed and bathtub references are supported by disjoint validation: they repair
+# ambiguous head/foot signs and occasional plate-axis swaps. The same trial
+# regressed monitor/piano and did not fix sofa/toilet, so those remain rules
+# only. Every ICP correction remains bounded to 25 degrees.
+REFINE_CLASSES = ("airplane", "car", "chair", "bed", "bathtub")
 
 
 def _one_way_chamfer(P, tree):
@@ -1796,7 +2083,7 @@ def _trimmed_cost(P, trees, keep=0.5):
 
 
 def snap_to_reference(P, trees, n_pts=384, coarse_pts=128, coarse_trees=4,
-                      shortlist=5, rng=None):
+                      shortlist=5, rng=None, rotations=None, min_improvement=0.0):
     """Pick the axis assignment that puts this cloud in the same attitude as the
     class reference.  Returned rotation is applied on the left of the rule's.
 
@@ -1812,14 +2099,17 @@ def snap_to_reference(P, trees, n_pts=384, coarse_pts=128, coarse_trees=4,
         P = P[rng.choice(len(P), n_pts, replace=False)]
     Pc = P[::max(1, len(P) // coarse_pts)]
     tc = trees[:coarse_trees]
-
-    coarse = sorted((_trimmed_cost(Pc @ F.T, tc), i) for i, F in enumerate(OCTAHEDRAL))
-    best, bestF = np.inf, np.eye(3)
+    rotations = OCTAHEDRAL if rotations is None else rotations
+    coarse = sorted((_trimmed_cost(Pc @ F.T, tc), i) for i, F in enumerate(rotations))
+    identity_cost = _trimmed_cost(P, trees)
+    best, bestF = identity_cost, np.eye(3)
     for _, i in coarse[:shortlist]:
-        F = OCTAHEDRAL[i]
+        F = rotations[i]
         c = _trimmed_cost(P @ F.T, trees)
         if c < best:
             best, bestF = c, F
+    if best >= identity_cost * (1.0 - min_improvement):
+        return np.eye(3)
     return bestF
 
 
@@ -1925,6 +2215,13 @@ def build_reference(clouds, cls, rule_canon, max_ref=10, n_pts=384, seed=0,
     mu, sd = F.mean(0), F.std(0) + EPS
     Fz = (F - mu) / sd
 
+    if cls == "airplane":
+        # Keep the semantic attitude of the rules. Free joint alignment can
+        # turn an entire ensemble tail-first, then undo a correct fin cue on
+        # every unseen aircraft. Shape matching only resolves weak axes.
+        return {"clusters": {0: Ps}, "centres": np.zeros((1, F.shape[1])),
+                "mu": mu, "sd": sd, "flat": True}
+
     if n_clusters <= 1:
         return {"clusters": {0: _joint_align(Ps)}, "centres": np.zeros((1, F.shape[1])),
                 "mu": mu, "sd": sd, "flat": True}
@@ -1980,7 +2277,8 @@ def save_references(path, refs, extra=None):
     were built with the principal-axis pre-canonicalisation on.  Aligning a new
     cloud under a different setting from the one the references were built with
     would silently mis-assign, so the setting travels with the file."""
-    arrays, meta = {}, {"pca_first": bool(PCA_FIRST), "classes": {}}
+    arrays, meta = {}, {"pca_first": bool(PCA_FIRST), "classes": {},
+                        "ruleset_version": RULESET_VERSION}
     for cls, ref in (refs or {}).items():
         if not ref or not ref.get("clusters"):
             continue
@@ -2004,6 +2302,10 @@ def load_references(path):
     """Read references written by save_references.  Returns (refs, meta)."""
     z = np.load(path, allow_pickle=False)
     meta = json.loads(bytes(z["__meta__"]).decode())
+    if meta.get("ruleset_version") != RULESET_VERSION:
+        warnings.warn("Reference cache predates the current orientation rules; "
+                      "rebuild it with --save-reference before comparing results.",
+                      UserWarning, stacklevel=2)
     refs = {}
     for cls, m in meta["classes"].items():
         clusters = {}
@@ -2031,6 +2333,7 @@ def make_canonicaliser(references=None, refine=True, refine_classes=None):
                     "flat": ref.get("flat", False)}
 
     def canon(X, cls):
+        cls = canonical_class_name(cls)
         R, info = canonicalise(X, cls)
         ref = store.get(cls)
         if not ref:
@@ -2050,7 +2353,15 @@ def make_canonicaliser(references=None, refine=True, refine_classes=None):
         ens, pl = ref["trees"][j], ref["pts"][j]
 
         P = normalise_cloud(X)[0] @ R.T
-        F = snap_to_reference(P, ens)
+        rotations = OCTAHEDRAL
+        locked = []
+        if cls == "airplane":
+            for axis, name in ((0, "forward"), (2, "up")):
+                if info.get(name + "_confidence", 0.0) >= 0.35:
+                    rotations = [F for F in rotations if F[axis, axis] > 0.99]
+                    locked.append(name)
+        F = snap_to_reference(P, ens, rotations=rotations,
+                              min_improvement=0.03 if cls == "airplane" else 0.0)
         R = F @ R
         tweak = 0.0
         if refine and (refine_classes is None or cls in refine_classes):
@@ -2059,8 +2370,14 @@ def make_canonicaliser(references=None, refine=True, refine_classes=None):
             M = refine_to_reference(Pf, ens[k], pl[k])
             R = M @ R
             tweak = math.degrees(math.acos(float(np.clip((np.trace(M) - 1) / 2, -1, 1))))
+        if cls == "bathtub":
+            # A reference can swap the initial axes. Test symmetry about the
+            # FINAL up axis, rather than carrying a stale C2z through a swap.
+            info = dict(info)
+            info["symmetry"], info["sym_scores"] = detect_axial_symmetry(
+                Shape(X), R[2], allow=("C2z",), min_score=0.65)
         info = dict(info, cluster=int(j), snapped=bool(not np.allclose(F, np.eye(3))),
-                    refined_deg=tweak)
+                    refined_deg=tweak, reference_locked_axes=locked)
         return R, info
 
     return canon
@@ -2086,10 +2403,21 @@ RULES = {"airplane": rule_airplane, "car": rule_car, "chair": rule_chair,
          "bookshelf": rule_bookshelf, "door": rule_door,
          "flower_pot": rule_flower_pot, "keyboard": rule_keyboard,
          "lamp": rule_lamp, "monitor": rule_monitor, "piano": rule_piano,
-         "toilet": rule_toilet, "wardrobe": rule_wardrobe}
+         "toilet": rule_toilet, "wardrobe": rule_wardrobe,
+         "cone": rule_cone, "sink": rule_bathtub, "stool": rule_table,
+         "vase": rule_vase}
 
 
 PCA_FIRST = True        # see canonicalise(); cleared by --no-pca-first
+
+
+def canonical_class_name(cls):
+    """Normalise common spelling variants before rule/reference dispatch."""
+    if cls is None:
+        return ""
+    name = cls.strip().lower().replace("-", "_").replace(" ", "_")
+    return {"plane": "airplane", "aeroplane": "airplane",
+            "flowerpot": "flower_pot"}.get(name, name)
 
 
 def canonicalise(X, cls):
@@ -2113,6 +2441,7 @@ def canonicalise(X, cls):
     an instance whose cue sits near its decision boundary now falls the same
     side every time instead of wavering, so consistency stops drifting between
     runs at whatever value it already had."""
+    cls = canonical_class_name(cls)
     pre = np.eye(3)
     if PCA_FIRST:
         pre, _ = pca_baseline(X)
@@ -2129,6 +2458,8 @@ def canonicalise(X, cls):
         U, _, Vt = np.linalg.svd(R)
         R = U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt
     info.setdefault("symmetry", DEFAULT_SYMMETRY.get(cls, "I"))
+    info["ambiguous_axes"] = [name for name in ("forward", "up")
+                              if info.get(name + "_confidence", 1.0) < 0.15]
     return R @ pre, info
 
 
@@ -2172,6 +2503,9 @@ FINITE_GROUPS = {
     # -- that is a genuine self-map, so the frame is only ever determined up to
     # it and the metrics must not charge for it.
     "C2x": [np.eye(3), _rx(np.pi)],
+    "C2y": [np.eye(3), np.diag([-1., 1., -1.])],
+    "D2": [np.eye(3), np.diag([1., -1., -1.]),
+           np.diag([-1., 1., -1.]), np.diag([-1., -1., 1.])],
     "C2z": [np.eye(3), _rz(np.pi)],
     "C3z": [_rz(2 * k * np.pi / 3) for k in range(3)],
     "C4z": [_rz(k * np.pi / 2) for k in range(4)],
@@ -2291,17 +2625,18 @@ def classify_leave_one_out(features, labels):
 # Evaluation
 # ----------------------------------------------------------------------------
 
-def stability_of_instance(X, cls, canon, k, rng):
+def stability_of_instance(X, cls, canon, k, rng, return_info=False):
     """Equivariance test.  The estimator should satisfy f(X A^T) = f(X) A^T, so
     R_k A_k is the same rotation for every random A_k when the estimator is
     perfectly stable.  Nothing is cached between rotations: every canonical
     frame is recomputed from the rotated points."""
     mats = [np.eye(3)] + random_rotations(k, rng)
-    frames, groups = [], []
+    frames, groups, diagnostics = [], [], []
     for A in mats:
         R, info = canon(X @ A.T, cls)
         frames.append(R @ A)
         groups.append(info.get("symmetry", "I"))
+        diagnostics.append(info)
     grp_free = dispersion_deg(frames, "I")[0]
     grp_quot = dispersion_deg(frames, groups)[0]
     # The frame handed to the consistency metric is the one recovered from a
@@ -2312,7 +2647,8 @@ def stability_of_instance(X, cls, canon, k, rng):
     # pose samples around that boundary and is what the object would arrive as
     # in use.
     i = 1 if len(frames) > 1 else 0
-    return grp_free, grp_quot, frames[i], groups[i]
+    result = (grp_free, grp_quot, frames[i], groups[i])
+    return result + (diagnostics[i],) if return_info else result
 
 
 def evaluate(dataset, canon, k_rot, seed, use_pred_labels=False, want_features=True,
@@ -2324,10 +2660,11 @@ def evaluate(dataset, canon, k_rot, seed, use_pred_labels=False, want_features=T
                                                       if cls in CLASS_ORDER else 7))
         t0 = time.time()
 
-        stab_raw, stab_sym, frames, groups, kept = [], [], [], [], []
+        stab_raw, stab_sym, frames, groups, kept, diagnostics = [], [], [], [], [], []
         for idx, X in enumerate(clouds):
             try:
-                a, b, R0, g0 = stability_of_instance(X, cls, canon, k_rot, rng)
+                a, b, R0, g0, info = stability_of_instance(
+                    X, cls, canon, k_rot, rng, return_info=True)
             except Exception as exc:
                 print(f"  [warn] {cls} instance {ids[idx]} skipped: {exc}")
                 continue
@@ -2336,6 +2673,7 @@ def evaluate(dataset, canon, k_rot, seed, use_pred_labels=False, want_features=T
             frames.append(R0)
             groups.append(g0)
             kept.append(ids[idx])
+            diagnostics.append(info)
         if not frames:
             print(f"  [warn] no usable instances for {cls}")
             continue
@@ -2363,6 +2701,8 @@ def evaluate(dataset, canon, k_rot, seed, use_pred_labels=False, want_features=T
             "consistency_within10": float(np.mean(np.asarray(cons_sym[1]) < 10.0)),
             "stability_within10": float(np.mean(np.asarray(stab_sym) < 10.0)),
             "per_instance_consistency_deg": cons_sym[1].tolist(),
+            "per_instance_rule_info": diagnostics,
+            "fallback_count": sum("fallback" in info for info in diagnostics),
             "symmetry_groups": groups,
             "mean_frame": cons_sym[2].tolist(),
             "seconds": time.time() - t0,

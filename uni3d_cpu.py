@@ -28,7 +28,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-UNI3D_ROOT = Path(os.environ.get("UNI3D_ROOT", Path.home() / "Uni3D"))
+LOCAL_UNI3D_ROOT = Path(__file__).resolve().parent / "vendor" / "Uni3D"
+UNI3D_ROOT = Path(os.environ.get(
+    "UNI3D_ROOT",
+    LOCAL_UNI3D_ROOT if (LOCAL_UNI3D_ROOT / "models" / "uni3d.py").is_file()
+    else Path.home() / "Uni3D",
+)).expanduser()
 CKPT_REPO, CKPT_FILE = "BAAI/Uni3D", "modelzoo/uni3d-s/model.pt"
 
 # scripts/inference.sh, the `small` branch plus the flags shared by every scale.

@@ -6,6 +6,13 @@ symmetry detection, then a class-specific rule. **No learning, no weights, no
 training data** in the canonicaliser itself. (Uni3D is used only to *name* the
 class, and only if you turn it on.)
 
+The current rule changes and validation are documented in
+[RULES.md](RULES.md). There are now 25 explicit class rules, including cone,
+sink, stool, and vase. Existing Uni3D centroids still cover the original 21
+classes; use explicit labels for the additions or rebuild the centroids.
+Saved references from earlier rules should be rebuilt, because their axis
+conventions can otherwise reintroduce flips.
+
 The pipeline reports two numbers, and they answer different questions:
 
 - **stability** — one cloud, many input poses. Does the frame follow the object?
@@ -26,10 +33,11 @@ clouds for you (`--classify`), you also need the Uni3D source tree, which is not
 pip-installable:
 
 ```
-git clone https://github.com/baaivision/Uni3D ~/Uni3D
+git clone --depth 1 https://github.com/baaivision/Uni3D vendor/Uni3D
 ```
 
-Put it at `~/Uni3D` or set `UNI3D_ROOT` to wherever you cloned it. The weights
+Run that command from `geo_canon`. The loader also accepts `~/Uni3D`, or set
+`UNI3D_ROOT` to wherever you cloned it. The weights
 (~44 MB) download automatically from the HuggingFace hub on first run and are
 cached. `uni3d_cpu.py` stubs out the CUDA extension the official repo asks for,
 so this runs on CPU with no nvcc.
@@ -118,7 +126,11 @@ python obj_to_pt.py
 
 ---
 
-## Which rules actually work
+## Historical measurements
+
+The figures below predate the current airplane, bed, bathtub, bench, and panel
+changes. Use [the current validation notes](RULES.md#validation) for those
+classes; these older figures are retained as background.
 
 Measured against each dataset's own stored orientation, which is ground truth
 for the up axis and needs no convention. "up<15°" is the share of instances
@@ -163,7 +175,7 @@ Three things worth knowing before you write anything up:
 
 | file | what it is |
 |---|---|
-| `geo_canon.py` | the whole pipeline: loaders, symmetry detection, all 21 class rules, references, metrics, CLI |
+| `geo_canon.py` | loaders, symmetry detection, 25 class rules, references, metrics, CLI |
 | `demo_app.py` | the browser demo and its HTTP API |
 | `uni3d_cpu.py` | loads Uni3D-S on CPU and encodes clouds |
 | `uni3d_probe.py` | builds `uni3d_centroids.npz` from labelled clouds |
