@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+
+# datasets and archives: share these out of band, not in the repo
+processed_data/
+shapenet_subset/
+figures/
+photos/
+new papers/
+*.zip
+*.ply
+
+# regenerated artefacts
+canonicalisation_report*.txt
+canonicalisation_results.json
+*_frames.png
+
+# stale artefacts: these predate the current rules, regenerate before citing
+refs.npz
+class_report.txt
+class_rules.txt
+stability_consistency.txt
+pipeline.txt
+
+# the earlier CanonNet/XAI line, not part of this pipeline
+*.ipynb
+
+# local editor / tooling state
+.puku/
+.claude/

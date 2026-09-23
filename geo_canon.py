@@ -1,0 +1,3064 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Class-conditional geometric canonicalisation of arbitrarily rotated point clouds.
+
+No learning, no weights, no training data.  Given a point cloud and its class
+label (airplane / car / chair / table / bowl) the pipeline computes a canonical
+rotation R in SO(3) by a deterministic sequence of geometric constructions:
+
+    principal axes -> symmetry detection -> class-specific semantic rule -> frame
+
+and then measures
+
+    STABILITY   : equivariance of the estimator under random input rotations
+    CONSISTENCY : agreement of the canonical frame across instances of a class
+
+Both metrics are reported raw and quotiented by the object's rotational
+symmetry group, so that a bowl (C_inf about its axis) or a square table (C_4)
+is not penalised for a rotation that maps the object onto itself.
+
+Usage
+-----
+    python geo_canon.py                       # auto: real data if found, else synthetic
+    python geo_canon.py --data processed_data # ShapeNet-style folders per synset id
+    python geo_canon.py --data shapenet_subset# raw .obj/.ply geometry, sampled
+    python geo_canon.py --data shapenet_subset --mesh-points 16384
+    python geo_canon.py --synthetic           # force procedural shapes
+    python geo_canon.py --instances 30 --rotations 8 --no-figures
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import time
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+
+SYNSET_TO_CLASS = {
+    "02691156": "airplane",
+    "02958343": "car",
+    "03001627": "chair",
+    "04379243": "table",
+    "02880940": "bowl",
+    "03642806": "laptop",
+    "02818832": "bed",
+    "02876657": "bottle",
+    "03467517": "guitar",
+    "04256520": "sofa",
+    # ModelNet classes.  Those that also exist in ShapeNet keep their synset so
+    # a raw ShapeNet tree still resolves; door, toilet and wardrobe have none,
+    # and load_real finds them by class name.
+    "02808440": "bathtub",
+    "02828884": "bench",
+    "02871439": "bookshelf",
+    "03085013": "keyboard",
+    "03636649": "lamp",
+    "03211117": "monitor",
+    "03928116": "piano",
+    "03991062": "flower_pot",
+}
+CLASS_ORDER = ["airplane", "car", "chair", "table", "bowl",
+               "laptop", "bed", "bottle", "guitar", "sofa",
+               "bathtub", "bench", "bookshelf", "door", "flower_pot",
+               "keyboard", "lamp", "monitor", "piano", "toilet", "wardrobe"]
+
+# Symmetry group of each class in CANONICAL coordinates (z = up, x = forward).
+# "I"     : trivial, the frame is fully determined
+# "C2z"   : 180 deg about canonical z is a self-map
+# "C4z"   : 90 deg steps about canonical z
+# "Cinfz" : any rotation about canonical z (surface of revolution)
+DEFAULT_SYMMETRY = {
+    "airplane": "I",
+    "car": "I",
+    "chair": "I",
+    "table": "C2z",     # upgraded per instance to C4z / Cinfz when the top is square / round
+    "bowl": "Cinfz",
+    "laptop": "I",
+    "bed": "I",
+    "bottle": "Cinfz",
+    "guitar": "I",
+    "sofa": "I",
+    "bathtub": "I",
+    "bench": "I",
+    "bookshelf": "I",
+    "door": "C2z",      # a door slab maps onto itself through its own height
+    "flower_pot": "Cinfz",
+    "keyboard": "C2z",
+    "lamp": "Cinfz",
+    "monitor": "I",
+    "piano": "I",
+    "toilet": "I",
+    "wardrobe": "I",
+}
+
+SIGMA_MATCH = 0.05      # tolerance of the symmetry matching kernel (cloud has rms radius 1)
+N_PROBE = 320           # points used to score a candidate symmetry
+MIRROR_TRIM = 0.80      # fraction of probes kept when scoring a mirror plane,
+                        # so that an occluded or cropped region cannot veto the
+                        # true plane of symmetry
+PARTIAL_MIRROR = False  # let the mirror plane leave the centroid.  Correct for
+                        # heavily occluded scans, but on complete clouds the
+                        # extra freedom invents planes -- an offset plane can
+                        # map one wing of an aircraft onto the other -- so it is
+                        # off by default and exposed as --partial-mirror
+EPS = 1e-12
+
+
+# ----------------------------------------------------------------------------
+# Data loading
+# ----------------------------------------------------------------------------
+
+MESH_EXT = {".obj", ".ply"}   # read by trimesh
+CLOUD_EXT = {".pt", ".npy", ".npz"}
+MESH_POINTS = 8192          # how densely a mesh is sampled when nobody says
+
+
+def sample_mesh(path: Path, n_points: int, seed: int) -> np.ndarray:
+    """n_points off a geometry file (.obj / .ply), as XYZ.
+
+    A mesh is sampled uniformly over its surface -- the same sampling as
+    obj_to_pt.py, so a cloud read straight off the mesh and one read from the
+    .pt that script writes are drawn from the same law.
+
+    A .ply carrying vertices and no faces is already a point cloud and is read
+    rather than sampled.  That includes a Gaussian-splat .ply: the xyz are the
+    splat centres, and everything that makes it a splat rather than a point --
+    opacity, scale, rotation, spherical harmonics -- is dropped, since the
+    pipeline only ever looks at positions.
+    """
+    import trimesh  # imported lazily so the script runs without trimesh
+    kind = path.suffix.lower().lstrip(".")
+    if kind == "ply":                    # may be either, so let the file say
+        geom = trimesh.load(path, file_type=kind, process=False)
+    else:
+        geom = trimesh.load(path, file_type=kind, process=False, force="mesh")
+    if isinstance(geom, trimesh.Scene):
+        geom = trimesh.util.concatenate(list(geom.geometry.values()))
+    if len(getattr(geom, "faces", ())) == 0:
+        return subsample(np.asarray(geom.vertices, dtype=np.float64), n_points, seed)
+    np.random.seed(seed)
+    points, _ = trimesh.sample.sample_surface(geom, n_points)
+    return np.asarray(points, dtype=np.float64)
+
+
+def cloud_id(path: Path) -> str:
+    """Name a cloud by its file, except a mesh, which is named by its model
+    folder -- every ShapeNet mesh is called model_normalized.obj."""
+    if path.suffix.lower() in MESH_EXT:
+        folder = path.parent
+        if folder.name == "models":       # <model_id>/models/model_normalized.obj
+            folder = folder.parent
+        return folder.name
+    return path.stem
+
+
+def load_xyz(path: Path, n_points: int = MESH_POINTS, seed: int = 0) -> np.ndarray:
+    """Read one point cloud from .pt / .npy / .npz, or take one off a .obj or
+    .ply geometry, keep XYZ only.  n_points and seed apply to geometry only."""
+    path = Path(path)
+    if path.suffix.lower() in MESH_EXT:
+        arr = sample_mesh(path, n_points, seed)
+    elif path.suffix == ".pt":
+        import torch  # imported lazily so the script runs without torch
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(obj, dict):
+            for key in ("points", "pos", "xyz", "point_cloud"):
+                if key in obj:
+                    obj = obj[key]
+                    break
+        if hasattr(obj, "detach"):
+            obj = obj.detach().cpu().numpy()
+        arr = np.asarray(obj)
+    elif path.suffix == ".npy":
+        arr = np.load(path)
+    elif path.suffix == ".npz":
+        z = np.load(path)
+        key = next((k for k in ("points", "pos", "xyz") if k in z), z.files[0])
+        arr = z[key]
+    else:
+        raise ValueError(f"unsupported file type: {path}")
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 2 or arr.shape[1] < 3:
+        raise ValueError(f"expected (N,>=3) array, got {arr.shape} from {path}")
+    return np.ascontiguousarray(arr[:, :3])
+
+
+def subsample(X: np.ndarray, n: int, seed: int) -> np.ndarray:
+    if len(X) <= n:
+        return X.copy()
+    rng = np.random.default_rng(seed)
+    return X[rng.choice(len(X), n, replace=False)]
+
+
+def natural_key(path):
+    """Sort car_2 before car_10.
+
+    The files are named <class>_<n>, so plain lexicographic order would take
+    1, 10, 100, 1000 as the first four instances of a class and make "the first
+    twelve" mean something nobody expects.
+    """
+    parts = re.split(r"(\d+)", Path(path).name)
+    return [int(t) if t.isdigit() else t for t in parts]
+
+
+def load_folder(root, n_points: int = 1024, seed: int = 0):
+    """Every cloud in one flat folder, as (clouds, ids).
+
+    load_real walks a tree of synset folders; this is for a folder that holds
+    one class already, such as results/<class>_aug0, whose files are dicts
+    ({points, knn_idx, variant}) rather than bare tensors.  load_xyz unwraps
+    those, so they need no converting.
+    """
+    root = Path(root)
+    clouds, ids = [], []
+    for i, p in enumerate(sorted(root.glob("*"), key=natural_key)):
+        if p.suffix.lower() not in CLOUD_EXT | MESH_EXT:
+            continue
+        try:
+            clouds.append(subsample(load_xyz(p, n_points, seed + i), n_points, seed + i))
+            ids.append(cloud_id(p))
+        except Exception as exc:
+            print(f"  [warn] skipped {p.name}: {exc}")
+    return clouds, ids
+
+
+def load_real(data_root: Path, n_instances: int, n_points: int, seed: int,
+              mesh_points: int | None = None):
+    """Return {class_name: (list_of_clouds, list_of_ids)} for whatever is present.
+
+    n_points thins a stored cloud, which has whatever size it was written with.
+    A mesh has no size of its own -- it is sampled -- so mesh_points (default
+    MESH_POINTS) says how densely, and that cloud is kept at that density
+    instead of being thinned to n_points.
+    """
+    mesh_points = int(mesh_points or MESH_POINTS)
+    out = {}
+    synset_of = {cls: syn for syn, cls in SYNSET_TO_CLASS.items()}
+    for cls in CLASS_ORDER:
+        # by synset folder if the class has one and the tree is raw ShapeNet,
+        # otherwise by a folder named after the class
+        folder = data_root / synset_of.get(cls, cls)
+        if not folder.is_dir():
+            folder = data_root / cls
+        if not folder.is_dir():
+            continue
+        files = sorted((p for p in folder.rglob("*")
+                        if p.suffix.lower() in CLOUD_EXT),
+                       key=natural_key)[:n_instances]
+        if not files:
+            # no sampled clouds here: fall back to the geometry itself, i.e.
+            # a raw ShapeNet tree of <synset>/<model_id>/[models/]*.obj
+            files = sorted((p for p in folder.rglob("*")
+                            if p.suffix.lower() in MESH_EXT),
+                           key=natural_key)[:n_instances]
+        if not files:
+            continue
+        clouds, ids = [], []
+        for i, f in enumerate(files):
+            try:
+                if f.suffix.lower() in MESH_EXT:
+                    clouds.append(load_xyz(f, mesh_points, seed + i))
+                else:
+                    clouds.append(subsample(load_xyz(f), n_points, seed + i))
+                ids.append(cloud_id(f))
+            except Exception as exc:                       # keep going on a bad file
+                print(f"  [warn] skipped {f.name}: {exc}")
+        if clouds:
+            out[cls] = (clouds, ids)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Procedural shapes (fallback / self-test).
+# Generated directly in canonical pose: z = up, x = forward.  The evaluation
+# rotates them randomly, so the generator never leaks its frame to the solver.
+# ----------------------------------------------------------------------------
+
+def _sample_box(rng, n, cx, cy, cz, sx, sy, sz):
+    """n points on the surface of an axis-aligned box."""
+    areas = np.array([sy * sz, sy * sz, sx * sz, sx * sz, sx * sy, sx * sy], float)
+    counts = rng.multinomial(n, areas / areas.sum())
+    pts = []
+    for face, k in enumerate(counts):
+        if k == 0:
+            continue
+        u, v = rng.random(k) - 0.5, rng.random(k) - 0.5
+        if face < 2:
+            p = np.stack([np.full(k, 0.5 if face == 0 else -0.5), u, v], 1)
+        elif face < 4:
+            p = np.stack([u, np.full(k, 0.5 if face == 2 else -0.5), v], 1)
+        else:
+            p = np.stack([u, v, np.full(k, 0.5 if face == 4 else -0.5)], 1)
+        pts.append(p * np.array([sx, sy, sz]) + np.array([cx, cy, cz]))
+    return np.concatenate(pts, 0) if pts else np.zeros((0, 3))
+
+
+def _sample_disc(rng, n, center, radius, axis=2, thickness=0.0):
+    r = radius * np.sqrt(rng.random(n))
+    a = rng.random(n) * 2 * np.pi
+    p = np.zeros((n, 3))
+    idx = [i for i in range(3) if i != axis]
+    p[:, idx[0]] = r * np.cos(a)
+    p[:, idx[1]] = r * np.sin(a)
+    p[:, axis] = (rng.random(n) - 0.5) * thickness
+    return p + np.asarray(center, float)
+
+
+def make_airplane(rng, n):
+    span = rng.uniform(0.8, 1.1)
+    length = rng.uniform(0.9, 1.2)
+    parts = []
+    # fuselage: tapered tube along x, nose at +x
+    k = int(0.30 * n)
+    t = rng.random(k)
+    radius = 0.055 * (1 - t ** 2.2) + 0.012
+    a = rng.random(k) * 2 * np.pi
+    parts.append(np.stack([length * (t - 0.35),
+                           radius * np.cos(a),
+                           radius * np.sin(a) * 0.9], 1))
+    k = int(0.14 * n)                                    # rear fuselage
+    t = rng.random(k)
+    radius = 0.055 * (1 - 0.7 * t)
+    a = rng.random(k) * 2 * np.pi
+    parts.append(np.stack([-0.35 * length - 0.32 * length * t,
+                           radius * np.cos(a), radius * np.sin(a)], 1))
+    k = int(0.30 * n)                                    # main wings, swept back
+    u = rng.random(k)
+    side = rng.choice([-1.0, 1.0], k)
+    chord = 0.26 * (1 - 0.6 * u)
+    parts.append(np.stack([-0.05 * length - 0.28 * u + (rng.random(k) - 0.5) * chord,
+                           side * u * span / 2,
+                           np.full(k, 0.0) + (rng.random(k) - 0.5) * 0.012], 1))
+    k = int(0.12 * n)                                    # horizontal stabiliser
+    u = rng.random(k)
+    side = rng.choice([-1.0, 1.0], k)
+    parts.append(np.stack([-0.58 * length - 0.12 * u + (rng.random(k) - 0.5) * 0.10,
+                           side * u * span * 0.30,
+                           np.full(k, 0.02)], 1))
+    k = n - sum(len(p) for p in parts)                   # vertical fin (breaks up/down)
+    u = rng.random(max(k, 1))
+    parts.append(np.stack([-0.58 * length - 0.14 * u + (rng.random(len(u)) - 0.5) * 0.10,
+                           (rng.random(len(u)) - 0.5) * 0.012,
+                           0.02 + u * 0.26], 1))
+    return np.concatenate(parts, 0)
+
+
+def make_car(rng, n):
+    length, width = rng.uniform(1.0, 1.25), rng.uniform(0.42, 0.52)
+    body_h, cabin_h = rng.uniform(0.22, 0.28), rng.uniform(0.16, 0.22)
+    parts = [_sample_box(rng, int(0.42 * n), 0.0, 0.0, body_h / 2 + 0.10,
+                         length, width, body_h)]
+    # cabin: narrower and set back from centre -> gives the up and forward signs
+    parts.append(_sample_box(rng, int(0.26 * n), -0.13 * length, 0.0,
+                             body_h + 0.10 + cabin_h / 2,
+                             length * 0.44, width * 0.80, cabin_h))
+    k = int(0.07 * n)
+    for sx in (0.30, -0.30):
+        for sy in (0.5, -0.5):
+            parts.append(_sample_disc(rng, k, (sx * length, sy * width * 1.02, 0.11),
+                                      0.105, axis=1, thickness=0.05))
+    return np.concatenate(parts, 0)
+
+
+def make_chair(rng, n):
+    w, d = rng.uniform(0.42, 0.55), rng.uniform(0.42, 0.55)
+    seat_h, back_h = rng.uniform(0.42, 0.50), rng.uniform(0.38, 0.55)
+    leg = 0.035
+    parts = [_sample_box(rng, int(0.38 * n), 0.0, 0.0, seat_h, d, w, 0.05)]
+    parts.append(_sample_box(rng, int(0.36 * n), -d / 2 + 0.03, 0.0,
+                             seat_h + back_h / 2, 0.05, w, back_h))
+    k = int(0.065 * n)
+    for sx in (0.42, -0.42):
+        for sy in (0.42, -0.42):
+            parts.append(_sample_box(rng, k, sx * d, sy * w, seat_h / 2,
+                                     leg, leg, seat_h))
+    return np.concatenate(parts, 0)
+
+
+def make_table(rng, n):
+    """Rectangular, square or round tops, in roughly the mix ShapeNet has.  The
+    shape of the top is the whole point of the symmetry stage: a rectangle is
+    C2, a square C4 and a round top C_inf, and each admits a different set of
+    equally valid canonical frames."""
+    kind = rng.choice(["rect", "square", "round"], p=[0.5, 0.2, 0.3])
+    h = rng.uniform(0.55, 0.75)
+    leg = 0.05
+    if kind == "round":
+        radius = rng.uniform(0.35, 0.6)
+        k = int(0.56 * n)
+        a = rng.random(k) * 2 * np.pi
+        rr = radius * np.sqrt(rng.random(k))
+        z = h + 0.05 * (rng.random(k) - 0.5)
+        parts = [np.stack([rr * np.cos(a), rr * np.sin(a), z], 1)]
+        if rng.random() < 0.5:                        # central pedestal
+            m = n - k
+            az = rng.random(m) * 2 * np.pi
+            pr = 0.07 * radius / 0.45
+            parts.append(np.stack([pr * np.cos(az), pr * np.sin(az),
+                                   h * rng.random(m)], 1))
+        else:                                         # four legs on a circle
+            m = (n - k) // 4
+            for ang in (0.25, 0.75, 1.25, 1.75):
+                parts.append(_sample_box(rng, m, 0.72 * radius * math.cos(ang * np.pi),
+                                         0.72 * radius * math.sin(ang * np.pi),
+                                         h / 2, leg, leg, h))
+        return np.concatenate(parts, 0)
+
+    a, b = rng.uniform(0.55, 1.1), rng.uniform(0.55, 1.1)
+    d, w = max(a, b), min(a, b)       # long side along x, matching the canonical rule
+    if kind == "square":
+        w = d
+    parts = [_sample_box(rng, int(0.56 * n), 0.0, 0.0, h, d, w, 0.05)]
+    k = int(0.11 * n)
+    for sx in (0.42, -0.42):
+        for sy in (0.42, -0.42):
+            parts.append(_sample_box(rng, k, sx * d, sy * w, h / 2, leg, leg, h))
+    return np.concatenate(parts, 0)
+
+
+def make_bowl(rng, n):
+    radius = rng.uniform(0.40, 0.55)
+    depth = radius * rng.uniform(0.55, 0.85)
+    k = int(0.78 * n)                                     # inner+outer surface of revolution
+    u = rng.random(k) ** 0.75
+    a = rng.random(k) * 2 * np.pi
+    rr = radius * np.sin(np.pi / 2 * u)
+    zz = depth * (1 - np.cos(np.pi / 2 * u))
+    parts = [np.stack([rr * np.cos(a), rr * np.sin(a), zz], 1)]
+    k2 = int(0.12 * n)                                    # rim ring, open side is +z
+    a = rng.random(k2) * 2 * np.pi
+    parts.append(np.stack([radius * np.cos(a), radius * np.sin(a),
+                           depth + rng.random(k2) * 0.012], 1))
+    k3 = n - k - k2                                       # flat base
+    parts.append(_sample_disc(rng, max(k3, 1), (0, 0, 0.004), radius * 0.30, axis=2))
+    return np.concatenate(parts, 0)
+
+
+SYNTHETIC = {"airplane": make_airplane, "car": make_car, "chair": make_chair,
+             "table": make_table, "bowl": make_bowl}
+
+
+def load_synthetic(n_instances: int, n_points: int, seed: int):
+    """Procedural stand-ins, for the classes that have a generator.
+
+    CLASS_ORDER has grown past the five shapes generated here, so it is the
+    generators that decide what --synthetic can offer, not the rule table.
+    """
+    out = {}
+    for ci, cls in enumerate(c for c in CLASS_ORDER if c in SYNTHETIC):
+        clouds, ids = [], []
+        for i in range(n_instances):
+            rng = np.random.default_rng(seed + 1000 * ci + i)
+            clouds.append(SYNTHETIC[cls](rng, n_points))
+            ids.append(f"{cls}_{i:03d}")
+        out[cls] = (clouds, ids)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Geometry primitives
+# ----------------------------------------------------------------------------
+
+def unit(v):
+    v = np.asarray(v, float)
+    n = np.linalg.norm(v)
+    return v / n if n > EPS else np.array([0.0, 0.0, 1.0])
+
+
+def normalise_cloud(X):
+    """Remove translation and scale.  Rotation is untouched, so the frame we
+    estimate afterwards is unaffected by this step."""
+    X = np.asarray(X, float)
+    c = X.mean(0)
+    Y = X - c
+    s = float(np.sqrt((Y ** 2).sum(1).mean()))
+    return Y / max(s, EPS), c, s
+
+
+def principal_axes(X):
+    """Eigen-decomposition of the covariance.  Columns of V are axes, sorted by
+    decreasing eigenvalue.  Equivariant: cov(X A^T) = A cov(X) A^T."""
+    C = (X.T @ X) / len(X)
+    w, V = np.linalg.eigh(C)
+    order = np.argsort(w)[::-1]
+    return w[order], V[:, order]
+
+
+def candidate_axes(w, V, tol=0.30, n_extra=16):
+    """The 3 principal axes, plus a fan inside any near-degenerate eigenplane.
+
+    For a shape with an exact mirror or rotational symmetry the symmetry axis is
+    an eigenvector of the covariance, so the principal axes are the right
+    candidate set.  When two eigenvalues nearly coincide the eigenvectors inside
+    that plane are numerically arbitrary, so the plane is sampled instead."""
+    cands = [V[:, 0], V[:, 1], V[:, 2]]
+    for i, j in ((0, 1), (1, 2), (0, 2)):
+        if abs(w[i] - w[j]) <= tol * max(abs(w[i]), abs(w[j]), EPS):
+            for t in np.linspace(0, np.pi, n_extra, endpoint=False)[1:]:
+                cands.append(math.cos(t) * V[:, i] + math.sin(t) * V[:, j])
+    return np.array([unit(c) for c in cands])
+
+
+def fib_hemisphere(n):
+    """n roughly equidistant directions on a hemisphere (canonical coordinates)."""
+    k = np.arange(n) + 0.5
+    z = k / n                                     # upper hemisphere only: d ~ -d
+    r = np.sqrt(np.maximum(1.0 - z * z, 0.0))
+    phi = np.pi * (1.0 + 5.0 ** 0.5) * k
+    return np.stack([r * np.cos(phi), r * np.sin(phi), z], 1)
+
+
+_FIB_CACHE = {}
+
+
+def direction_grid(V, n):
+    """The hemisphere grid rotated into the object's own principal frame, so the
+    search set follows the object instead of the world axes.  A rotated copy of
+    the cloud gets the rotated grid, which is what keeps the search equivariant;
+    any residual error from a noisy principal frame is removed by the refit that
+    follows the search."""
+    if n not in _FIB_CACHE:
+        _FIB_CACHE[n] = fib_hemisphere(n)
+    return _FIB_CACHE[n] @ V.T
+
+
+def complement(n):
+    """Two unit vectors spanning the plane orthogonal to n."""
+    n = unit(n)
+    a = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = unit(a - (a @ n) * n)
+    return u, np.cross(n, u)
+
+
+def frame_from(forward, up):
+    """Right-handed rotation with rows [x=forward, y=left, z=up].
+    Canonical coordinates of a world point p are R @ p, i.e. P = X @ R.T."""
+    z = unit(up)
+    x = forward - (forward @ z) * z
+    if np.linalg.norm(x) < 1e-8:                     # degenerate input, pick anything
+        x = complement(z)[0]
+    x = unit(x)
+    y = np.cross(z, x)
+    R = np.vstack([x, y, z])
+    if np.linalg.det(R) < 0:                         # cannot happen, kept as a guard
+        R[1] *= -1
+    return R
+
+
+def is_rotation(R, atol=1e-7):
+    return (np.allclose(R.T @ R, np.eye(3), atol=atol)
+            and abs(np.linalg.det(R) - 1.0) < atol)
+
+
+def random_rotations(k, rng):
+    """Uniform on SO(3) via QR of a Gaussian matrix (Haar measure)."""
+    out = []
+    for _ in range(k):
+        Q, R = np.linalg.qr(rng.normal(size=(3, 3)))
+        Q = Q * np.sign(np.diag(R))
+        if np.linalg.det(Q) < 0:
+            Q[:, 0] *= -1
+        out.append(Q)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Symmetry detection
+# ----------------------------------------------------------------------------
+
+class Shape:
+    """A normalised cloud plus the structures every rule needs."""
+
+    def __init__(self, X, n_probe=N_PROBE, sigma=SIGMA_MATCH):
+        X = np.asarray(X, float)
+        if X.ndim != 2 or X.shape[1] != 3:
+            raise ValueError(f"expected (N,3) points, got {X.shape}")
+        if len(X) < 24:
+            raise ValueError(f"need at least 24 points, got {len(X)}")
+        self.X, self.centre, self.scale = normalise_cloud(X)
+        self.n = len(self.X)
+        self.tree = cKDTree(self.X)
+        step = max(1, self.n // n_probe)
+        self.probe = self.X[::step][:n_probe]
+        # The matching kernel must track the sampling density: a fixed width
+        # either saturates on dense clouds or registers nothing on sparse ones.
+        nn, _ = self.tree.query(self.X, k=2, workers=-1)
+        self.nn_spacing = float(np.median(nn[:, 1]))
+        self.sigma = max(sigma, 1.5 * self.nn_spacing)
+        self.w, self.V = principal_axes(self.X)
+        self.cands = candidate_axes(self.w, self.V)
+        self._grids = {}
+
+    def grid(self, n):
+        if n not in self._grids:
+            self._grids[n] = np.vstack([self.V.T, direction_grid(self.V, n)])
+        return self._grids[n]
+
+    def match_score(self, Y, trim=None):
+        """Mean Gaussian agreement between transformed probes and the cloud.
+        Equivariant by construction: distances are preserved by rotation.
+
+        `trim` keeps only that fraction of the best-matched probes.  A cloud
+        with a missing region has no partner for the reflections of what
+        survives next to the hole, and an untrimmed mean lets such a hole veto
+        the true plane; the trimmed mean scores the plane on the part of the
+        object that is actually present."""
+        d, _ = self.tree.query(Y, workers=-1)
+        s = np.exp(-(d / self.sigma) ** 2)
+        if trim is not None and trim < 1.0:
+            k = max(8, int(round(trim * len(s))))
+            s = np.partition(s, len(s) - k)[len(s) - k:]
+        return float(s.mean())
+
+    def mirror_score(self, normals, trim=None):
+        """Reflection symmetry score for one or many plane normals."""
+        trim = MIRROR_TRIM if trim is None else trim
+        normals = np.atleast_2d(normals)
+        P = self.probe
+        out = np.empty(len(normals))
+        for i, n in enumerate(normals):
+            n = unit(n)
+            out[i] = self.match_score(P - 2.0 * np.outer(P @ n, n), trim=trim)
+        return out
+
+    def rot_score(self, axis, angles=(np.pi / 2, 2 * np.pi / 3, 0.83)):
+        """Rotational symmetry about an axis, averaged over several angles.
+        Irrational-looking angles test for a full surface of revolution."""
+        a = unit(axis)
+        K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+        s = 0.0
+        for th in angles:
+            R = np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * (K @ K)
+            s += self.match_score(self.probe @ R.T)
+        return s / len(angles)
+
+
+def mirror_score_at(shape, n, offset=0.0, trim=None):
+    """Reflection score for the plane {x : n.x = offset}."""
+    n = unit(n)
+    P = shape.probe
+    Pr = P - 2.0 * np.outer(P @ n - offset, n)
+    return shape.match_score(Pr, trim=MIRROR_TRIM if trim is None else trim)
+
+
+def best_offset(shape, n, span=0.18, n_steps=13, trim=None):
+    """Best displacement of the plane along its own normal.
+
+    The centroid lies on the symmetry plane only when the whole object is
+    present.  Crop a cloud, or occlude it, and the centroid slides off the
+    plane, so a search restricted to planes through the centroid rejects the
+    true symmetry.  One cheap 1-D scan along the normal restores it."""
+    offs = np.linspace(-span, span, n_steps)
+    sc = [mirror_score_at(shape, n, o, trim) for o in offs]
+    i = int(np.argmax(sc))
+    return float(offs[i]), float(sc[i])
+
+
+def refine_mirror(shape, n, iters=6, trim=0.8, offset=0.0, estimate_offset=True):
+    """Sharpen a mirror plane by constrained ICP.
+
+    Reflect the cloud, take nearest-neighbour correspondences, then solve for the
+    improper motion x -> M x + t (det M = -1) that best explains them.  The plane
+    normal is the eigenvector of M with eigenvalue -1 and the plane offset is
+    t.n/2.  Estimating t as well as M is what makes this work on partial clouds.
+    The result is a continuous function of the cloud instead of a grid pick."""
+    X = shape.X
+    n = unit(n)
+    for _ in range(iters):
+        Xr = X - 2.0 * np.outer(X @ n - offset, n)
+        d, j = shape.tree.query(Xr, workers=-1)
+        keep = d <= max(np.quantile(d, trim), 1e-6)      # trimmed, robust to holes
+        P, Q = X[keep], X[j[keep]]
+        if len(P) < 12:
+            break
+        if estimate_offset:
+            pc, qc = P.mean(axis=0), Q.mean(axis=0)
+            H = (P - pc).T @ (Q - qc)
+        else:
+            pc = qc = np.zeros(3)
+            H = P.T @ Q                                   # maximise tr(M H) over O(3)^-
+        U, S, Vt = np.linalg.svd(H)
+        D = np.eye(3)
+        if np.linalg.det(Vt.T @ U.T) > 0:
+            D[2, 2] = -1.0
+        M = Vt.T @ D @ U.T
+        Msym = 0.5 * (M + M.T)
+        ew, ev = np.linalg.eigh(Msym)
+        n_new = unit(ev[:, 0])                            # eigenvalue closest to -1
+        if n_new @ n < 0:
+            n_new = -n_new
+        off_new = float((qc - M @ pc) @ n_new) / 2.0 if estimate_offset else 0.0
+        shift = np.linalg.norm(n_new - n) + abs(off_new - offset)
+        n, offset = n_new, off_new
+        if shift < 1e-6:
+            break
+    return n, offset
+
+
+def best_mirror(shape, n_grid=48, n_refine=3, partial=None):
+    """Strongest reflection plane.
+
+    Candidates are the principal axes, which are exactly the mirror normals of a
+    perfectly symmetric shape, together with a coarse grid that covers the case
+    where two eigenvalues are close and the eigenvectors are therefore poorly
+    determined.  The best few are polished by ICP -- with a plane offset when
+    `partial`, so that a cropped or occluded cloud is still matched -- and the
+    winner is kept only if the polish did not make the score worse."""
+    partial = PARTIAL_MIRROR if partial is None else partial
+    cands = np.vstack([shape.cands, shape.grid(n_grid)])
+    scores = shape.mirror_score(cands)
+    order = np.argsort(scores)[::-1][:n_refine]
+    best_n, best_s = cands[order[0]], float(scores[order[0]])
+    for idx in order:
+        n0 = cands[idx]
+        o0 = best_offset(shape, n0)[0] if partial else 0.0
+        n, o = refine_mirror(shape, n0, offset=o0, estimate_offset=partial)
+        sc = mirror_score_at(shape, n, o)
+        if sc > best_s:
+            best_n, best_s = n, sc
+    return unit(best_n), best_s
+
+
+# ----------------------------------------------------------------------------
+# Semantic geometric features along a direction
+# ----------------------------------------------------------------------------
+
+def slab_peak(X, d, width=0.07, ends_only=True, end_frac=0.38):
+    """Largest fraction of points inside a thin slab perpendicular to d.
+
+    A table top, a chair back or any flat plate produces a sharp peak when d is
+    its normal.  Returns (fraction, centre, at_high_end)."""
+    t = np.sort(X @ unit(d))
+    lo, hi = t[0], t[-1]
+    span = max(hi - lo, EPS)
+    w = width * span
+    j = np.searchsorted(t, t + w, side="right")
+    count = j - np.arange(len(t))
+    centre = t + w / 2
+    if ends_only:
+        ok = (centre <= lo + end_frac * span) | (centre >= hi - end_frac * span)
+        if not ok.any():
+            ok = np.ones(len(t), bool)
+        count = np.where(ok, count, -1)
+    k = int(np.argmax(count))
+    frac = count[k] / len(t)
+    c = float(centre[k])
+    return float(frac), c, bool(c > (lo + hi) / 2)
+
+
+def support_score(X, d, bottom_frac=0.30):
+    """How leg-like the low end of direction d is.
+
+    Legs and wheels are sparse in mass but wide in footprint, which is what
+    separates 'down' from every other direction for chairs, tables and cars.
+    Returns a score; larger means d is more plausibly 'up'."""
+    d = unit(d)
+    t = X @ d
+    lo, hi = t.min(), t.max()
+    span = max(hi - lo, EPS)
+    m = t <= lo + bottom_frac * span
+    f = float(m.mean())
+    if f < 1e-3:
+        return 0.0
+    u, v = complement(d)
+    P = np.stack([X @ u, X @ v], 1)
+    r_all = float(np.sqrt((P ** 2).sum(1)).mean()) + EPS
+    r_bot = float(np.sqrt((P[m] ** 2).sum(1)).mean())
+    return (r_bot / r_all) ** 2 / (f + 0.08)
+
+
+def taper_sign(X, d, frac=0.33):
+    """+1 if the cloud is wider (perpendicular to d) at the low end than at the
+    high end.  A car body is wide at the wheels and narrow at the roof."""
+    d = unit(d)
+    t = X @ d
+    lo, hi = t.min(), t.max()
+    span = max(hi - lo, EPS)
+    u, v = complement(d)
+    P = np.stack([X @ u, X @ v], 1)
+    r = np.sqrt((P ** 2).sum(1))
+    bot = r[t <= lo + frac * span]
+    top = r[t >= hi - frac * span]
+    if len(bot) < 5 or len(top) < 5:
+        return 1.0
+    return 1.0 if bot.mean() >= top.mean() else -1.0
+
+
+def top_is_shorter(X, d, frac=0.20):
+    """True when the high end of d spans less of the object's long horizontal
+    axis than the low end does.
+
+    The cue that separates a roof from an underbody and a backrest from a floor
+    pan: the thing you sit on or drive on runs the whole length of the object,
+    while what sits on top of it -- cabin, greenhouse, backrest -- covers only
+    part of it.  Unlike support_score this asks about extent, not about mass,
+    so a sparse-but-wide top cannot pass itself off as a set of legs.
+
+    Measured over 50 ShapeNet instances per class, on the instances whose up
+    AXIS the rule already gets right (so this scores the sign alone), against
+    ShapeNet's own +y:
+
+        cue                  chair    car   table
+        support_score        52.9%  43.9%   93.3%
+        taper_sign           67.6%  92.7%   76.7%
+        top_is_shorter       82.4%  87.8%   63.3%
+
+    So chair takes this one, car takes taper_sign, and table keeps support:
+    a table is legs and a flat top with nothing above it, which is the case
+    support_score was written for.
+    """
+    d = unit(d)
+    t = X @ d
+    w = X - np.outer(t, d)                        # the horizontal part
+    wc = w - w.mean(0)
+    long_axis = unit(np.linalg.svd(wc, full_matrices=False)[2][0])
+    L = w @ long_axis
+    lo, hi = np.quantile(t, frac), np.quantile(t, 1.0 - frac)
+    top, bot = L[t > hi], L[t < lo]
+    if len(top) < 5 or len(bot) < 5:
+        return True
+    return float(np.ptp(top)) <= float(np.ptp(bot))
+
+
+def floor_score(X, d, frac=0.10):
+    """How much the low end of d looks like a foot standing on a floor: wide
+    across and thin along d.  support_score asks about mass, this asks about
+    planarity, which is what separates a base from an open rim."""
+    d = unit(d)
+    t = X @ d
+    span = max(float(np.ptp(t)), EPS)
+    m = t <= t.min() + frac * span
+    if m.sum() < 8:
+        return 0.0
+    u, v = complement(d)
+    P = np.stack([X[m] @ u, X[m] @ v], 1)
+    return float(np.sqrt((P ** 2).sum(1)).mean()) / (float(np.std(t[m])) / span + 0.02)
+
+
+def base_coverage(X, d, frac=0.08, cells=10):
+    """How much of the footprint the lowest slab along d actually fills.
+
+    The cue support_score and floor_score both miss on a cabinet: they ask how
+    wide the low end is and how thin, and the top of a bookshelf answers both
+    as well as the bottom does.  What separates them is that the base is a
+    closed panel and covers the footprint, while the other end is a rim, a
+    back edge or an open top and covers only part of it.  So the footprint is
+    gridded and the occupied fraction returned.
+
+    Measured on bookshelves: 50% of instances land up within 15 deg against
+    43% for support_score, and the frame is stable where the tempting
+    variants -- a thicker slab, a finer grid -- are not."""
+    d = unit(d)
+    t = X @ d
+    span = max(float(np.ptp(t)), EPS)
+    m = t <= t.min() + frac * span
+    if m.sum() < 8:
+        return 0.0
+    u, v = complement(d)
+    P = np.stack([X @ u, X @ v], 1)           # footprint of the whole object
+    lo, hi = P.min(0), P.max(0)
+    q = np.floor((P[m] - lo) / np.maximum(hi - lo, EPS) * (cells - 1e-9)).astype(int)
+    return len(set(map(tuple, q.tolist()))) / float(cells * cells)
+
+
+def end_spread(X, d, frac=0.16):
+    """Perpendicular spread of the two extreme slices along d, as (low, high).
+    An aircraft nose is a point, its tail carries the stabilisers."""
+    d = unit(d)
+    t = X @ d
+    lo, hi = t.min(), t.max()
+    span = max(hi - lo, EPS)
+    u, v = complement(d)
+    P = np.stack([X @ u, X @ v], 1)
+    r = np.sqrt((P ** 2).sum(1))
+    a = r[t <= lo + frac * span]
+    b = r[t >= hi - frac * span]
+    return (float(a.mean()) if len(a) else 0.0,
+            float(b.mean()) if len(b) else 0.0)
+
+
+def plane_normal_of_slab(X, d, centre, width=0.09):
+    """Refit a plate's normal from the points inside its slab.  Continuous in
+    the data, which is what keeps the estimator equivariant."""
+    d = unit(d)
+    t = X @ d
+    span = max(t.max() - t.min(), EPS)
+    m = np.abs(t - centre) <= width * span
+    if m.sum() < 20:
+        return d, 0.0
+    Y = X[m] - X[m].mean(0)
+    w, V = np.linalg.eigh((Y.T @ Y) / len(Y))
+    n = unit(V[:, 0])
+    flat = 1.0 - w[0] / max(w[2], EPS)
+    if n @ d < 0:
+        n = -n
+    return n, float(flat)
+
+
+# ----------------------------------------------------------------------------
+# Class-conditional canonicalisation rules
+#
+# Every rule returns (R, info).  R maps world coordinates to canonical
+# coordinates: P = X @ R.T, with z = up, x = forward, y = left.
+# ----------------------------------------------------------------------------
+
+def _plane_pca_axes(X, n):
+    """Principal directions of the cloud projected onto the plane normal to n,
+    returned as (major, minor) 3-vectors.  Closed form, so it is exact and
+    continuous rather than a search."""
+    u, v = complement(n)
+    P = np.stack([X @ u, X @ v], 1)
+    C = (P.T @ P) / len(P)
+    w, E = np.linalg.eigh(C)
+    major = unit(E[0, 1] * u + E[1, 1] * v)
+    minor = unit(E[0, 0] * u + E[1, 0] * v)
+    return major, minor, float(w[1]), float(w[0])
+
+
+def _circle_argmax(X, n, fn, n_samples=180, refine=3):
+    """Maximise fn(direction) over the full circle of directions orthogonal to n.
+    Coarse sweep followed by parabolic refinement of the peak."""
+    u, v = complement(n)
+    phis = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
+    vals = np.array([fn(math.cos(p) * u + math.sin(p) * v) for p in phis])
+    k = int(np.argmax(vals))
+    step = phis[1] - phis[0]
+    best_phi, best_val = phis[k], vals[k]
+    for _ in range(refine):                       # local trisection around the peak
+        step /= 3.0
+        for p in (best_phi - step, best_phi + step):
+            d = math.cos(p) * u + math.sin(p) * v
+            val = fn(d)
+            if val > best_val:
+                best_phi, best_val = p, val
+    return unit(math.cos(best_phi) * u + math.sin(best_phi) * v), float(best_val)
+
+
+def rule_airplane(shape):
+    """Mirror plane normal is the wing span.  Inside that plane the long axis is
+    the fuselage and the short one is vertical.  The nose is the blunt-free end
+    (small perpendicular spread); the fin fixes which way is up."""
+    X = shape.X
+    span, mscore = best_mirror(shape)
+    got = plate_axis(X, span, min_frac=0.12)      # the wing sheet fixes the roll
+    if got is not None:
+        up = got[0]
+        fwd = unit(np.cross(span, up))
+        cue = "wing_plate"
+    else:
+        fwd, up, _, _ = _plane_pca_axes(X, span)
+        cue = "plane_pca"
+
+    lo, hi = end_spread(X, fwd)                   # tail carries the stabilisers
+    if lo < hi:
+        fwd = -fwd                                # nose at the low end -> flip
+    t = X @ fwd                                   # fin cue inside the tail region
+    tail = X[t <= np.quantile(t, 0.25)]
+    if len(tail) > 10:
+        s_ = tail @ up
+        if abs(s_.max()) < abs(s_.min()):
+            up = -up
+    else:
+        s_ = X @ up
+        if abs(np.quantile(s_, 0.99)) < abs(np.quantile(s_, 0.01)):
+            up = -up
+    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
+                                 "symmetry": "I"}
+
+
+def rule_car(shape):
+    """Mirror plane normal is the lateral axis.  Inside the plane the long axis
+    is the travel direction and the short one is vertical.  The body is wide at
+    the wheels and narrow at the roof, and the cabin sits behind the centre."""
+    X = shape.X
+    lat, mscore = best_mirror(shape)
+    got = plate_axis(X, lat, min_frac=0.10)       # roof / floor pan
+    if got is not None:
+        up = got[0]
+        fwd = unit(np.cross(lat, up))
+        cue = "body_plate"
+    else:
+        fwd, up, _, _ = _plane_pca_axes(X, lat)
+        cue = "plane_pca"
+
+    # The wide end goes at the bottom, and nothing gets to overrule that.
+    # support_score used to have the last word here and was wrong more often
+    # than a coin: it rewards a sparse wide end, and a car's greenhouse is
+    # exactly that, so it read the roof as the floor and parked 44% of the
+    # class on its head.  taper_sign alone: 92.7%.  See top_is_shorter.
+    if taper_sign(X, up) < 0:
+        up = -up
+
+    h = X @ up                                    # the cabin sits behind the centre
+    hi, span_ = h.max(), max(h.max() - h.min(), EPS)
+    offset = 0.0
+    for band in (0.15, 0.20, 0.25):               # take the most decisive band
+        m = h >= hi - band * span_
+        if m.sum() >= 10:
+            o = float((X[m] @ fwd).mean())
+            if abs(o) > abs(offset):
+                offset = o
+    if offset > 0:
+        fwd = -fwd
+    return frame_from(fwd, up), {"mirror_score": mscore, "roof_offset": abs(offset),
+                                 "up_cue": cue, "symmetry": "I"}
+
+
+def plate_sweep(X, n, n_samples=180, width=0.06):
+    """Sweep the circle of directions orthogonal to n and record, for each, the
+    strongest flat plate and where it sits along that direction.
+
+    The distinction that matters is interior versus terminal: a chair's seat is
+    a plate in the middle of the vertical extent, its back is a plate at the end
+    of the horizontal extent.  That is what separates up from forward without
+    any appeal to which dimension happens to be larger."""
+    u, v = complement(n)
+    phis = np.linspace(0, np.pi, n_samples, endpoint=False)
+    rec = []
+    for p in phis:
+        d = math.cos(p) * u + math.sin(p) * v
+        frac, centre, _ = slab_peak(X, d, width=width, ends_only=False)
+        t = X @ d
+        lo, hi = t.min(), t.max()
+        rel = (centre - lo) / max(hi - lo, EPS)
+        rec.append((frac, rel, d, centre))
+    return rec
+
+
+def plate_axis(X, lat, width=0.06, interior_only=False, min_frac=0.08,
+               n_samples=180, iters=3):
+    """Strongest flat plate whose normal is orthogonal to lat, refined by
+    alternately refitting the plate and re-locating its slab.
+
+    Plates are what carry the semantics here: the wing sheet of an aircraft, the
+    roof and floor pan of a car, the seat of a chair, the top of a table.  Their
+    normals are far better conditioned than in-plane principal axes, which get
+    dragged around by any front-to-back asymmetry of the mass."""
+    rec = plate_sweep(X, lat, n_samples=n_samples, width=width)
+    pool = [r for r in rec if 0.28 <= r[1] <= 0.72] if interior_only else rec
+    if not pool:
+        return None
+    frac, rel, d, centre = max(pool, key=lambda r: r[0])
+    if frac < min_frac:
+        return None
+    for _ in range(iters):
+        n, flat = plane_normal_of_slab(X, d, centre, width=width + 0.03)
+        n = n - (n @ lat) * lat
+        if np.linalg.norm(n) < 1e-6 or flat < 0.85:
+            break
+        n = unit(n)
+        if n @ d < 0:
+            n = -n
+        if math.degrees(math.acos(float(np.clip(n @ d, -1, 1)))) > 20.0:
+            break
+        f2, c2, _ = slab_peak(X, n, width=width, ends_only=False)
+        if f2 < frac - 0.005:                      # keep only a genuine improvement
+            break
+        d, centre, frac = n, c2, f2
+    return unit(d), float(frac), float(centre), float(rel)
+
+
+def rule_chair(shape):
+    """Mirror plane normal is the lateral axis.  Up is the normal of the seat,
+    found as the strongest plate sitting in the interior of its own extent.  The
+    legs fix which way is up and the backrest fixes which way is forward."""
+    X = shape.X
+    lat, mscore = best_mirror(shape)
+    got = plate_axis(X, lat, interior_only=True)
+
+    if got is not None:
+        up, frac, centre, _ = got
+        cue = "seat_plate"
+    else:                                          # stool or heavily curved seat
+        up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
+        cue = "support"
+
+    # Which way is down.  support_score answers this well for a table but not
+    # for a chair, where it scored 52.9% -- a chair's back is sparse and wide
+    # and reads as a set of legs.  The backrest covers only part of the seat,
+    # so extent separates them where mass does not: 82.4%.
+    if not top_is_shorter(X, up):
+        up = -up
+
+    fwd = unit(np.cross(lat, up))
+    h = X @ up                                     # backrest sits above the seat
+    seat_h = float(np.median(h))
+    upper = X[h >= seat_h]
+    if len(upper) > 10 and float((upper @ fwd).mean()) > 0:
+        fwd = -fwd
+    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
+                                 "symmetry": "I"}
+
+
+def detect_axial_symmetry(shape, up, allow=("C2z", "C4z", "Cinfz")):
+    """Measure, rather than assume, the rotational symmetry about the up axis.
+
+    A generic angle gives the chance level of the matching score for this cloud,
+    which is what the candidate symmetries are compared against.  Only the
+    symmetries the class can actually have are tested, so a car is never granted
+    a 180 degree ambiguity just because its body is roughly a box."""
+    generic = float(np.mean([shape.rot_score(up, angles=(a,))
+                             for a in (0.77, 1.31, 2.21)]))
+    s180 = shape.rot_score(up, angles=(np.pi,))
+    s90 = shape.rot_score(up, angles=(np.pi / 2,))
+    sc = {"generic": generic, "s180": s180, "s90": s90}
+    if "Cinfz" in allow and generic >= 0.85 * max(s180, s90) and s180 > 1e-6:
+        return "Cinfz", sc
+    if "C4z" in allow and s90 >= 0.90 * s180 and s180 >= 1.25 * generic:
+        return "C4z", sc
+    if "C2z" in allow and s180 >= 1.30 * generic:
+        return "C2z", sc
+    return "I", sc
+
+
+def detect_flip_symmetry(shape, fwd, factor=1.30):
+    """Does turning this object upside down leave it unchanged?
+
+    Asked of a shelf unit, because the answer is often yes: strip a bookcase of
+    its back and its shelves and what is left is an open rectangular tube with
+    a flat panel at each end, and no cue can say which panel is the floor
+    because the object itself does not distinguish them.  Measured per instance
+    against a generic-angle baseline, exactly as detect_axial_symmetry does it,
+    so a cabinet with a plinth or a closed top is not granted the ambiguity."""
+    generic = float(np.mean([shape.rot_score(fwd, angles=(a,))
+                             for a in (0.77, 1.31, 2.21)]))
+    s180 = float(shape.rot_score(fwd, angles=(np.pi,)))
+    return ("C2x" if s180 >= factor * generic else "I"), {"s180": s180,
+                                                          "generic": generic}
+
+
+def rule_table(shape):
+    """Up is the normal of the dominant flat plate, which is the top, refined by
+    fitting that plate.  In plane, the long side of the top's minimum-area
+    rectangle becomes x.  The top's outline sets the symmetry group."""
+    from scipy.spatial import ConvexHull
+    X = shape.X
+
+    best = (-1.0, None, None, None)
+    for d in shape.grid(128):
+        frac, centre, at_high = slab_peak(X, d, width=0.07, ends_only=True)
+        if frac > best[0]:
+            best = (frac, unit(d), centre, at_high)
+    frac, up, centre, at_high = best
+
+    for _ in range(3):                            # alternate: fit plate, re-slab
+        n, flat = plane_normal_of_slab(X, up, centre)
+        if flat < 0.85:
+            break
+        up = n
+        frac, centre, at_high = slab_peak(X, up, width=0.07, ends_only=True)
+    if not at_high:                               # put the top on the +z side
+        up, centre = -up, -centre
+
+    t = X @ up                                    # in-plane orientation from the top
+    span = max(t.max() - t.min(), EPS)
+    m = np.abs(t - centre) <= 0.10 * span
+    u, v = complement(up)
+    P2 = np.stack([X[m] @ u, X[m] @ v], 1) if m.sum() >= 16 else np.stack([X @ u, X @ v], 1)
+    P2 = P2 - P2.mean(0)
+
+    angle, area_best, dims = 0.0, np.inf, (1.0, 1.0)
+    try:
+        hull = P2[ConvexHull(P2).vertices]
+        edges = np.roll(hull, -1, 0) - hull
+        for e in edges:                           # rotating calipers
+            L = np.linalg.norm(e)
+            if L < 1e-9:
+                continue
+            c, s_ = e[0] / L, e[1] / L
+            Rw = np.array([[c, s_], [-s_, c]])
+            Z = hull @ Rw.T
+            ext = Z.max(0) - Z.min(0)
+            if ext[0] * ext[1] < area_best:
+                area_best, angle, dims = ext[0] * ext[1], math.atan2(s_, c), tuple(ext)
+    except Exception:
+        w2, E2 = np.linalg.eigh((P2.T @ P2) / max(len(P2), 1))
+        angle = math.atan2(E2[1, 1], E2[0, 1])
+        dims = (float(np.sqrt(w2[1])), float(np.sqrt(w2[0])))
+
+    long_dir = (math.cos(angle) * u + math.sin(angle) * v)
+    if dims[1] > dims[0]:
+        long_dir = -math.sin(angle) * u + math.cos(angle) * v
+    aspect = max(dims) / max(min(dims), EPS)
+    sym, sd = detect_axial_symmetry(shape, up)
+    return frame_from(long_dir, up), {"top_fraction": float(frac),
+                                      "aspect": float(aspect),
+                                      "symmetry": sym, "sym_scores": sd}
+
+
+def rule_bowl(shape):
+    """A bowl is a surface of revolution, so its axis is the covariance
+    eigenvector with the isolated eigenvalue; the rotational symmetry score
+    confirms it.  The open side is the one with the larger radius."""
+    X = shape.X
+    scores = np.array([shape.rot_score(d) for d in shape.cands])
+    axis = unit(shape.cands[int(np.argmax(scores))])
+
+    k = int(np.argmax([abs(shape.V[:, i] @ axis) for i in range(3)]))
+    axis = unit(shape.V[:, k])                    # snap to the exact eigenvector
+    if shape.V[:, k] @ (shape.cands[int(np.argmax(scores))]) < 0:
+        axis = -axis
+
+    lo, hi = end_spread(X, axis, frac=0.22)       # rim is wide, base is narrow
+    up = axis if hi >= lo else -axis
+    sym, sd = detect_axial_symmetry(shape, up)
+    j = 0 if k != 0 else 1                        # any equivariant in-plane seed
+    seed = shape.V[:, j] - (shape.V[:, j] @ up) * up
+    fwd = unit(seed) if np.linalg.norm(seed) > 1e-6 else complement(up)[0]
+    return frame_from(fwd, up), {"rot_score": float(scores.max()), "symmetry": sym,
+                                 "sym_scores": sd}
+
+
+# ----------------------------------------------------------------------------
+# Five more classes, on the same skeleton: a lateral axis, an up axis, and the
+# signs that separate front from back.  What differs between them is only which
+# cue is trusted for each, and the docstrings say what was measured to pick it.
+# ----------------------------------------------------------------------------
+
+def rule_laptop(shape):
+    """Mirror normal is lateral, a plate gives up, the screen fixes forward.
+
+    Structurally this is rule_chair: both objects are bilaterally symmetric,
+    both rest on a flat underside, and in both the tall part sits above and
+    behind.  A laptop has two panels where a chair has one seat, but the
+    interior-plate test still resolves them, and the panel it settles on is
+    consistent enough across instances to carry the frame.
+
+    Up is the base panel's normal, found as a plate the way rule_chair finds a
+    seat.  The support cue is deliberately NOT used to choose this direction:
+    it rewards the widest ground footprint, and a laptop resting on the two
+    outer edges of its panels -- hinge in the air, an inverted V -- spreads
+    wider than one sitting on its base, so support alone lands every instance
+    in a tent pose and picks between tents inconsistently.  Measured: support
+    gives 81 deg RMS across five instances, the plate gives 34.  Laptop is the
+    hard case of these five: its two largest eigenvalues are nearly equal
+    (lam1/lam2 ~ 1.2), so the PCA pre-frame can swap axes between poses and the
+    rule inherits that wobble.
+    """
+    X = shape.X
+    lat, mscore = best_mirror(shape)
+
+    got = plate_axis(X, lat, interior_only=True)
+    if got is None:                               # no clean panel: fall back
+        up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
+        cue = "support"
+    else:
+        up, cue = got[0], "plate"
+    up = unit(up - (up @ lat) * lat)              # keep the frame orthogonal
+
+    if support_score(X, up) < support_score(X, -up):   # support fixes only the sign
+        up = -up
+
+    fwd = unit(np.cross(lat, up))
+    h = X @ up
+    upper = X[h >= float(np.median(h))]           # screen half
+    if len(upper) > 10 and float((upper @ fwd).mean()) > 0:
+        fwd = -fwd
+    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
+                                 "symmetry": "I"}
+
+
+def rule_bed(shape):
+    """Mattress plane gives up, headboard gives forward.
+
+    A broad horizontal platform with a tall part at one end, which is
+    rule_chair's situation exactly.  up comes from the platform plate rather
+    than from support, for the reason rule_laptop documents: support rewards
+    the widest footprint, not the surface the object actually rests on.
+    Support is left to fix the sign.
+    """
+    X = shape.X
+    lat, mscore = best_mirror(shape)
+
+    got = plate_axis(X, lat, interior_only=True)
+    if got is None:
+        up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
+        cue = "support"
+    else:
+        up, cue = got[0], "plate"
+    up = unit(up - (up @ lat) * lat)
+    if support_score(X, up) < support_score(X, -up):
+        up = -up
+
+    fwd = unit(np.cross(lat, up))
+    # The headboard is the top slice, not merely the upper half: a bed is
+    # mostly mattress, so a median split is dominated by the platform and the
+    # sign it returns is close to a coin toss.
+    h = X @ up
+    crown = X[h >= float(np.percentile(h, 72))]
+    if len(crown) > 10 and float((crown @ fwd).mean()) > 0:
+        fwd = -fwd
+    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
+                                 "symmetry": "I"}
+
+
+def rule_sofa(shape):
+    """Long axis gives lateral, support gives up, backrest gives forward.
+
+    Deliberately does NOT use best_mirror, unlike bed.  Measured on twenty
+    sofas, the mirror normal drifts by up to 88 degrees between poses of the
+    *same* cloud (bed and guitar: 0.0), because a sofa is close enough to a box
+    to offer several competing near-equal mirror planes and the grid search
+    settles into different ones.  That wobble was the whole of the rule's
+    instability: taking the lateral axis from the inertia tensor instead, where
+    lam1/lam2 is ~3.7 and nothing is tied, takes stability from 6.49 to 0.00 and
+    halves the median disagreement.
+    """
+    X = shape.X
+    lat = unit(shape.V[:, 0])                     # a sofa's long axis runs across it
+
+    up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
+    up = unit(up - (up @ lat) * lat)
+    if support_score(X, up) < support_score(X, -up):
+        up = -up
+
+    fwd = unit(np.cross(lat, up))
+    h = X @ up
+    crown = X[h >= float(np.percentile(h, 72))]   # backrest
+    if len(crown) > 10 and float((crown @ fwd).mean()) > 0:
+        fwd = -fwd
+    return frame_from(fwd, up), {"up_cue": "support", "symmetry": "I"}
+
+
+def rule_bottle(shape):
+    """A bottle is a surface of revolution, so the axis is the eigenvector with
+    the isolated eigenvalue and the rotational score confirms it.
+
+    This is rule_bowl with the sign reversed: a bowl's wide end is its rim and
+    points up, a bottle's wide end is its base and points down.
+    """
+    X = shape.X
+    scores = np.array([shape.rot_score(d) for d in shape.cands])
+    axis = unit(shape.cands[int(np.argmax(scores))])
+
+    k = int(np.argmax([abs(shape.V[:, i] @ axis) for i in range(3)]))
+    snapped = unit(shape.V[:, k])                 # snap to the exact eigenvector
+    if snapped @ axis < 0:
+        snapped = -snapped
+    axis = snapped
+
+    lo, hi = end_spread(X, axis, frac=0.22)       # base is wide, neck is narrow
+    up = axis if lo >= hi else -axis
+    sym, sd = detect_axial_symmetry(shape, up)
+
+    j = 0 if k != 0 else 1                        # any equivariant in-plane seed
+    seed = shape.V[:, j] - (shape.V[:, j] @ up) * up
+    fwd = unit(seed) if np.linalg.norm(seed) > 1e-6 else complement(up)[0]
+    return frame_from(fwd, up), {"rot_score": float(scores.max()),
+                                 "symmetry": sym, "sym_scores": sd}
+
+
+def rule_guitar(shape):
+    """Near-planar and very elongated, which makes two of the three axes free.
+
+    lambda3 is ~0.4% of the trace, so the body plane is unambiguous, and
+    lambda1/lambda2 is ~10, so the neck axis is unambiguous.  Neither needs a
+    cue -- the inertia tensor already separates them cleanly.  All that is left
+    is three signs.
+
+    best_mirror must NOT be used here, which cost a version to learn.  A guitar
+    is near-planar, and reflecting a flat object through its own plane is almost
+    an exact symmetry, so the strongest mirror is sometimes the body plane and
+    sometimes the left-right plane: across twenty instances it split 10/10
+    between PC3 and PC2.  A cue that bistable rotates the frame about the neck
+    by ~90 degrees on half the class.
+
+    The neck ends up along +z on all 20, which is the axis that matters.  The
+    face-vs-back sign is the part that does not work: five different cues were
+    measured and none beat a third moment, and the residual is not a clean 180
+    degree flip either (quotienting one out still leaves ~29 degrees), so this
+    is reported as a partial result rather than dressed up with a symmetry
+    group it does not have.
+    """
+    X = shape.X
+    up = unit(shape.V[:, 0])                      # neck-to-body long axis
+    fwd = unit(shape.V[:, 2])                     # body-plane normal
+
+    lo, hi = end_spread(X, up, frac=0.25)
+    if hi > lo:                                   # body is the wide end: put it down
+        up = -up
+    if float(((X @ fwd) ** 3).mean()) < 0:        # face vs back, by third moment
+        fwd = -fwd
+    return frame_from(fwd, up), {"symmetry": "I"}
+
+
+# ----------------------------------------------------------------------------
+# Three skeletons and the eleven classes built on them.
+#
+# Every rule below is one skeleton plus a choice of cue, and the choice was
+# measured rather than argued.  The ModelNet clouds these classes come from are
+# stored z-up and azimuth aligned, so the angle between the rule's canonical z
+# and the stored z is ground truth needing no convention; the azimuth is scored
+# as agreement across instances, because ModelNet's idea of 'front' need not be
+# this pipeline's and a whole-frame comparison cannot tell those apart.
+#
+#   class        skeleton     up axis   up sign      up<15 deg   azimuth median
+#   bathtub      upright      plate     wide end up      25%        34 deg
+#   bench        upright      plate     support          58%        91 deg
+#   bookshelf    upright      tallest   floor            25%       110 deg
+#   door         slab         PC1       third moment     64%         4 deg
+#   flower_pot   revolution   rot axis  wide end up      79%        11 deg
+#   keyboard     slab         PC3       third moment     64%        58 deg
+#   lamp         revolution   rot axis  wide end up      57%        13 deg
+#   monitor      upright      tallest   wide end up      42%        19 deg
+#   piano        upright      plate     support          50%        64 deg
+#   toilet       upright      plate     top_is_shorter   36%        62 deg
+#   wardrobe     upright      tallest   top_is_shorter    8%       104 deg
+#
+# door, flower_pot, lamp and keyboard work.  bathtub, bench, monitor and piano
+# find up more often than not.  bookshelf, toilet and wardrobe do not work and
+# are reported rather than dressed up: a wardrobe is a box, and a box upside
+# down is still a box, so there is no geometric cue to read.
+# ----------------------------------------------------------------------------
+
+def _sign_support(X, u):
+    return support_score(X, u) >= support_score(X, -u)
+
+
+def _sign_floor(X, u):
+    return floor_score(X, u) >= floor_score(X, -u)
+
+
+def _sign_top_short(X, u):
+    return top_is_shorter(X, u)
+
+
+def _sign_wide_up(X, u):
+    """Hollow things -- a tub, a screen on a stand -- carry their width at the
+    open end, which is the end that points up."""
+    return taper_sign(X, u) < 0
+
+
+def _sign_base(X, u):
+    """Down is the end whose slab covers the footprint: a closed base."""
+    return base_coverage(X, u) >= base_coverage(X, -u)
+
+
+def _sign_third(X, u):
+    """Heavy end low, by the third moment along u."""
+    return float(((X @ u) ** 3).mean()) <= 0
+
+
+UP_SIGNS = {"support": _sign_support, "floor": _sign_floor,
+            "top_short": _sign_top_short, "wide_up": _sign_wide_up,
+            "third": _sign_third, "base": _sign_base}
+
+
+def upright_frame(shape, up_axis="plate", up_sign="support", crown_pct=72,
+                  flip_symmetry=False):
+    """Bilaterally symmetric, stands on a floor, tall part at one end.
+
+    The mirror normal is the lateral axis; up is found inside the plane it
+    spans, either as the strongest interior plate (a seat, a lid, a mattress)
+    or as the direction the object reaches furthest along; and the crown -- the
+    top slice -- sits behind, which fixes forward.
+    """
+    X = shape.X
+    lat, mscore = best_mirror(shape)
+
+    if up_axis == "principal":
+        # The object's OWN axes, not a swept direction.  Sweeping the circle
+        # for maximum extent finds the diagonal of the height-by-depth
+        # rectangle rather than the height: for a wardrobe 2.0 tall and 0.6
+        # deep that diagonal sits 17 deg off vertical, which is the whole of
+        # the error.  Measured on bookshelves, sweeping puts up 24.4 deg out
+        # (45% within 15 deg) where the principal axis puts it 1.2 deg out
+        # (85%); on wardrobes 25.2 deg / 35% against 0.9 deg / 80%.
+        cands = [unit(shape.V[:, i]) for i in range(3)]
+        cands = [c for c in cands if abs(c @ lat) < 0.5] or cands
+        up = max(cands, key=lambda c: float(np.ptp(X @ c)))
+        cue = "principal"
+    elif up_axis == "sharpest":
+        # The densest flat plate in any direction, wherever it sits along its
+        # own extent.  plate_axis asks for an INTERIOR plate, which is right
+        # for a seat with a back above it and wrong for a bench: strip the back
+        # off and the seat is the top surface, with nothing above it to make it
+        # interior, so the test rejects the one plate that matters.  Measured
+        # on twenty benches, the interior test puts up 7.3 deg out (65% within
+        # 15 deg) and this puts it 1.2 deg out (80%).
+        up, _ = _circle_argmax(X, lat, lambda d: slab_peak(X, d, ends_only=False)[0])
+        cue = "sharpest_plate"
+    elif up_axis == "tallest":
+        up, _ = _circle_argmax(X, lat, lambda d: float(np.ptp(X @ unit(d))))
+        cue = "tallest"
+    else:
+        got = plate_axis(X, lat, interior_only=True)
+        if got is None:
+            up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
+            cue = "support"
+        else:
+            up, cue = got[0], "plate"
+    up = unit(up - (up @ lat) * lat)
+    if not UP_SIGNS[up_sign](X, up):
+        up = -up
+
+    fwd = unit(np.cross(lat, up))
+    h = X @ up
+    crown = X[h >= float(np.percentile(h, crown_pct))]
+    if len(crown) > 10 and float((crown @ fwd).mean()) > 0:
+        fwd = -fwd
+    sym, sc = "I", None
+    if flip_symmetry:
+        sym, sc = detect_flip_symmetry(shape, fwd)
+    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
+                                 "symmetry": sym, "flip_scores": sc}
+
+
+def revolution_frame(shape, wide_end_up=True):
+    """A surface of revolution: the axis carries everything, the azimuth is
+    free, and the only question is which end of the axis is up.  rule_bowl and
+    rule_bottle are the same construction with the sign decided per class."""
+    X = shape.X
+    scores = np.array([shape.rot_score(d) for d in shape.cands])
+    axis = unit(shape.cands[int(np.argmax(scores))])
+    k = int(np.argmax([abs(shape.V[:, i] @ axis) for i in range(3)]))
+    snapped = unit(shape.V[:, k])                  # snap to the exact eigenvector
+    axis = snapped if snapped @ axis > 0 else -snapped
+
+    lo, hi = end_spread(X, axis, frac=0.22)
+    up = axis if ((hi >= lo) == wide_end_up) else -axis
+    sym, sd = detect_axial_symmetry(shape, up)
+    j = 0 if k != 0 else 1                         # any equivariant in-plane seed
+    seed = shape.V[:, j] - (shape.V[:, j] @ up) * up
+    fwd = unit(seed) if np.linalg.norm(seed) > 1e-6 else complement(up)[0]
+    return frame_from(fwd, up), {"rot_score": float(scores.max()),
+                                 "symmetry": sym, "sym_scores": sd}
+
+
+def slab_frame(shape, up_axis=0, fwd_axis=2, up_sign="third"):
+    """Thin and rectangular, so the inertia tensor hands over both axes and
+    only the signs are left.  Declared C2z, which is honest for a slab and has
+    the useful consequence that the face sign comes free: flipping forward
+    flips lateral with it, and that pair is exactly the C2z image."""
+    X = shape.X
+    up = unit(shape.V[:, up_axis])
+    fwd = unit(shape.V[:, fwd_axis])
+    if not UP_SIGNS[up_sign](X, up):
+        up = -up
+    fwd = unit(fwd - (fwd @ up) * up)
+    return frame_from(fwd, up), {"symmetry": "C2z"}
+
+
+def rule_bathtub(shape):
+    """A tub is a bowl with a mirror plane: the rim is the wide end and it
+    points up.  Every cue that reads width as a footprint -- support, floor,
+    taper -- lands it upside down (155 deg out), because the open rim is
+    exactly what they reward; reversing the taper fixes it (up<15 on 25%)."""
+    return upright_frame(shape, "plate", "wide_up")
+
+
+def rule_bench(shape):
+    """The seat plate gives up, support fixes the sign (58%), and the backrest
+    or armrest gives forward.  A backless bench has no forward cue at all,
+    which is where the 91 deg median azimuth comes from.
+
+    The class is not one shape: measured over twenty instances the long-to-mid
+    aspect ratio is 2.30 +- 0.91, against 1.43 +- 0.29 for chair, because
+    ModelNet files long backless planks and compact backed benches under the
+    same name.  A plank with slab legs is also unchanged by being turned over
+    -- its Chamfer distance to its own flip is 0.40 of a generic turn, against
+    0.75 for a chair, and on 65% of instances it is a real self-map -- so the
+    flip is tested per instance and reported as C2x when it holds.
+
+    Up comes from the sharpest plate rather than the interior one, which is
+    what a backless bench needs: 80% within 15 deg against 65%.  The azimuth
+    stays poor (80 deg) and no cue will fix it, because a plank has no front."""
+    return upright_frame(shape, "sharpest", "support", flip_symmetry=True)
+
+
+def rule_bookshelf(shape):
+    """A box: up is the tallest principal axis, support signs it.
+
+    plate_axis locks onto the back panel, whose normal is horizontal, so the
+    plate cue lands the frame 83 deg out.  The axis is not really the hard
+    part once it is taken from the object's own axes -- 1.2 deg out, 85% --
+    but the sign is: a bookshelf with evenly spaced shelves has no up.  Best
+    measured sign is support at 43% within 15 deg, up from 25%.
+
+    A shelf-counting cue was measured and rejected: scoring a direction by how
+    comb-like the density is along it puts the axis 39 deg out (40%), because
+    the back panel is one large flat plate and outweighs four shelves.
+
+    The sign comes from base_coverage -- the base is a closed panel and fills
+    the footprint where the top does not -- which reads 50% against support's
+    43% and leaves the frame stable.
+
+    Where it cannot work is where there is nothing to read: a bookcase with no
+    back and no shelves is an open tube with a flat panel at each end, and it
+    is genuinely unchanged by being turned over.  detect_flip_symmetry tests
+    that per instance and reports C2x when it holds, so those instances are
+    measured against their own symmetry instead of being marked wrong."""
+    return upright_frame(shape, "principal", "base", flip_symmetry=True)
+
+
+def flat_panel_frame(shape):
+    """One frame for every thin rectangular panel, whatever it is called.
+
+    Uni3D cannot reliably tell a door from a keyboard, and no geometric rule
+    can either: both are a rectangle a few centimetres thick, and once the
+    cloud is normalised the only difference is an aspect ratio that the two
+    classes overlap on.  Rather than let a coin-flip label choose between two
+    conventions, both classes get this one, so a misprediction costs nothing --
+    the canonical pose is the same either way.
+
+    The convention is up along the long axis, forward along the panel normal,
+    signed by the flat foot.  Both of the other two were measured and are
+    worse: pointing up along the normal instead makes the panel's face the
+    sign that matters, and which face a door shows is exactly the thing no cue
+    can read, so the azimuth falls apart (door 83 deg median against 4 deg).
+    Signing the long axis by the third moment rather than the foot costs the
+    keyboard (74 deg against 27 deg).  A keyboard therefore canonicalises
+    standing on its edge, which is the price of the two classes agreeing."""
+    return slab_frame(shape, up_axis=0, fwd_axis=2, up_sign="floor")
+
+
+def rule_door(shape):
+    """A door is a flat panel; see flat_panel_frame for why it shares its
+    frame with the keyboard.  Its axes are the cleanest of these eleven --
+    the panel normal is 0.6 deg out and the azimuth agrees to 4 deg."""
+    return flat_panel_frame(shape)
+
+
+def rule_flower_pot(shape):
+    """A surface of revolution whose rim is wide and points up, like a bowl.
+    The best of these eleven: up within 15 deg on 79%, azimuth 11 deg."""
+    return revolution_frame(shape, wide_end_up=True)
+
+
+def rule_keyboard(shape):
+    """A keyboard is a flat panel; see flat_panel_frame.  It shares its frame
+    with the door on purpose, because the classifier cannot separate them.
+
+    Putting the keys upward was tried and cannot be done from this data.  The
+    idea is sound -- one face is a plain panel and the other carries keys --
+    but these models are 10 to 17 times wider than they are thick, and their
+    two faces sample almost identically.  Six cues were measured against the
+    stored orientation: surface roughness at each face 45%, denser face 55%,
+    mass above the midplane 40%, base coverage 40%, sharper density peak 30%,
+    third moment 60%.  Nothing clears 60% on twenty models, which is two
+    models away from a coin toss, and the sign is absorbed by C2z anyway."""
+    return flat_panel_frame(shape)
+
+
+def rule_lamp(shape):
+    """Shade up.  A lamp is a surface of revolution and its wide end is the
+    shade, not the base -- signing it the other way is 178 deg wrong on every
+    instance, which is as clean a confirmation as this file has."""
+    return revolution_frame(shape, wide_end_up=True)
+
+
+def rule_monitor(shape):
+    """A screen on a stand: the screen is the wide end and it is at the top.
+
+    The plate cue fails because the panel it finds is the screen itself, whose
+    normal is horizontal (89 deg out).  With up taken from a principal axis and
+    signed by the wide end, 79% land within 15 deg, up from 42%."""
+    return upright_frame(shape, "principal", "wide_up")
+
+
+def rule_piano(shape):
+    """The lid plate gives up and support signs it (50%).  The keyboard end
+    should give forward and does not reliably -- an upright and a grand put
+    their mass in different places, and the two shapes share a class."""
+    return upright_frame(shape, "plate", "support")
+
+
+def rule_toilet(shape):
+    """Reported as a failure: up lands within 15 deg on 36% of instances.
+
+    The shape is right there -- a bowl at mid height, a cistern standing at the
+    back, a pedestal on the floor -- and none of it is readable from 1024
+    points.  What was measured, all of it on the twenty instances:
+
+        up axis, sweeping the plane the mirror leaves free
+            interior plate (the seat)                  40%
+            terminal plate allowed                     40%
+            sharpest plate anywhere                    45%
+            flat foot                                  10%
+            base coverage                              40%
+            perpendicular to the most terminal plate   35%
+            tallest direction in the plane              5%
+            widest mid-height cut                       0%
+            ring-with-a-hole at the seat               40%
+        up sign, over the two best axes
+            support, floor, base, top_is_shorter, crown at 72 and 88
+            -- best whole-frame result 35%
+        consensus instead of a cue
+            one reference ensemble                     12%
+            three clusters                              0%
+            snapping to a template built from the
+            dataset's own stored poses                 33%
+
+    The cues disagree with each other rather than with the truth, which is what
+    it looks like when a class has no single geometry: a toilet's height and
+    its depth are within 15% of each other, so nothing separates up from
+    forward by size, and the cistern is present on some models and absent on
+    others.  The rule below is the best of them and it is still wrong more
+    often than right.  Do not quote this class."""
+    return upright_frame(shape, "plate", "top_short")
+
+
+def rule_wardrobe(shape):
+    """A box, so up is a principal axis and the third moment signs it.
+
+    The axis is easy once taken from the object's own axes (0.9 deg, 80%).
+    The sign is not: a wardrobe upside down is still a wardrobe.  base_coverage
+    and the third moment tie exactly here at 57% within 15 deg, up from 8%, and
+    coverage is the one kept because it is the same argument the bookshelf
+    makes.  A weak cue rather than a real one -- do not quote this class.
+
+    Flip symmetry is tested per instance for the same reason as the bookshelf:
+    a plain box really is unchanged by turning it over."""
+    return upright_frame(shape, "principal", "base", flip_symmetry=True)
+
+
+def octahedral_rotations():
+    """The 24 rotations that map the coordinate axes onto themselves.
+
+    These are exactly the mistakes the rules make.  Every cue that fixes a sign
+    or picks which axis is up is a discrete choice on a continuous statistic,
+    so when it fails it does not fail by a few degrees -- it swaps an axis or
+    turns the object end for end, which is one of these 24."""
+    import itertools
+    mats = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1.0, -1.0), repeat=3):
+            M = np.zeros((3, 3))
+            for i, p in enumerate(perm):
+                M[i, p] = signs[i]
+            if abs(np.linalg.det(M) - 1.0) < 1e-9:
+                mats.append(M)
+    return mats
+
+
+OCTAHEDRAL = octahedral_rotations()
+
+# Only the classes whose rules fail by swapping an axis get a reference.  A
+# table or a bowl is symmetric about its own vertical, so several attitudes are
+# genuinely equivalent, the nearest-reference choice among them is arbitrary,
+# and forcing one costs accuracy instead of adding any.
+REFERENCE_CLASSES = ("airplane", "car", "chair")
+
+# How many shape clusters each class's reference is split into.  One means a
+# single ensemble, which is right for classes whose members look alike.
+#
+# Chairs need more.  Measured on real ShapeNet with held-out instances, a single
+# chair ensemble scored a median of 94 degrees with nothing inside 10; split
+# into four clusters the same machinery gives a median of 9.2 degrees with 54%
+# inside 10.  The synset holds dining chairs, stools, benches and armchairs, so
+# matching an instance against the class as a whole is decided by shape mismatch
+# rather than by attitude.  Aligning within a cluster, then aligning the handful
+# of cluster references to each other, matches like with like.
+#
+# Measured on 50-60 real instances with held-out scoring: chairs go from nothing
+# inside 10 degrees to 60% with four clusters, and cars from a median of 3.3 to
+# 1.6.  Airplanes get worse -- 84% down to 63% -- and their stability rises from
+# 0.1 to 3.2 degrees, which gives the reason away: stability cannot move at all
+# under --pca-first unless a discrete choice is wavering, and the only new one is
+# the cluster assignment.  Airplane clusters are not cleanly separated, so a
+# borderline plane lands in different clusters for different input poses.  They
+# keep a single ensemble.
+CLUSTERS_PER_CLASS = {"chair": 4, "car": 4}
+# Chair is deliberately absent.  Measured on real ShapeNet, the reference made
+# chairs worse, not better: median error went from 14 to 64 degrees and the
+# share within 10 degrees from 44% to zero.  Chairs vary so much in shape that
+# each one snaps and tilts towards a different ensemble member, which scatters
+# the class instead of gathering it.  Planes and cars are uniform enough for the
+# same machinery to help.  Override with --reference-classes.
+REFINE_CLASSES = ("airplane", "car", "chair")
+
+
+def _one_way_chamfer(P, tree):
+    d, _ = tree.query(P, workers=-1)
+    return float(d.mean())
+
+
+def _trimmed_cost(P, trees, keep=0.5):
+    """Distance from a cloud to an ensemble, using only the nearest half of the
+    members.  A class holds several shapes -- a stool, an armchair, a bench --
+    and a cloud only has to match the members it resembles.  Averaging over all
+    of them lets the unlike ones drown out the signal."""
+    d = sorted(_one_way_chamfer(P, t) for t in trees)
+    k = max(1, int(round(keep * len(d))))
+    return float(np.mean(d[:k]))
+
+
+def snap_to_reference(P, trees, n_pts=384, coarse_pts=128, coarse_trees=4,
+                      shortlist=5, rng=None):
+    """Pick the axis assignment that puts this cloud in the same attitude as the
+    class reference.  Returned rotation is applied on the left of the rule's.
+
+    Scoring all 24 assignments against the whole ensemble costs more than the
+    rule itself, so a cheap pass on a sparse subsample and a few members picks a
+    shortlist and only those are scored properly.  The coarse pass only has to
+    rank the right answer in the top few, which is easy: a wrong axis assignment
+    is wrong by tens of degrees, not by a hair."""
+    if not isinstance(trees, (list, tuple)):
+        trees = [trees]
+    rng = rng or np.random.default_rng(0)
+    if len(P) > n_pts:
+        P = P[rng.choice(len(P), n_pts, replace=False)]
+    Pc = P[::max(1, len(P) // coarse_pts)]
+    tc = trees[:coarse_trees]
+
+    coarse = sorted((_trimmed_cost(Pc @ F.T, tc), i) for i, F in enumerate(OCTAHEDRAL))
+    best, bestF = np.inf, np.eye(3)
+    for _, i in coarse[:shortlist]:
+        F = OCTAHEDRAL[i]
+        c = _trimmed_cost(P @ F.T, trees)
+        if c < best:
+            best, bestF = c, F
+    return bestF
+
+
+def _kmeans(F, k, seed=0, iters=60):
+    """Plain k-means with k-means++ seeding, on standardised features."""
+    rng = np.random.default_rng(seed)
+    n = len(F)
+    k = max(1, min(k, n))
+    centres = [F[rng.integers(n)]]
+    for _ in range(k - 1):
+        d = np.min([((F - c) ** 2).sum(1) for c in centres], axis=0)
+        tot = float(d.sum())
+        centres.append(F[rng.choice(n, p=d / tot)] if tot > 1e-12 else F[rng.integers(n)])
+    C = np.array(centres)
+    lab = np.full(n, -1)
+    for _ in range(iters):
+        new_lab = np.argmin(((F[:, None, :] - C[None, :, :]) ** 2).sum(2), axis=1)
+        if np.array_equal(new_lab, lab):
+            break
+        lab = new_lab
+        for j in range(k):
+            m = lab == j
+            if m.any():
+                C[j] = F[m].mean(0)
+    return lab, C
+
+
+def _joint_align(Ps, iters=5):
+    """Turn a set of canonical clouds into agreement with each other, by letting
+    each repeatedly re-pick its axis assignment to fit the others.  No instance
+    has to be right on its own; the correct attitude is simply the one they can
+    all agree on."""
+    Ps = [P.copy() for P in Ps]
+    trees = [cKDTree(P) for P in Ps]
+    for _ in range(iters):
+        moved = False
+        for i in range(len(Ps)):
+            others = [t for j, t in enumerate(trees) if j != i]
+            if not others:
+                continue
+            F = min(OCTAHEDRAL, key=lambda M: _trimmed_cost(Ps[i] @ M.T, others))
+            if not np.allclose(F, np.eye(3)):
+                Ps[i] = Ps[i] @ F.T
+                trees[i] = cKDTree(Ps[i])
+                moved = True
+        if not moved:
+            break
+    return Ps
+
+
+def _align_clusters(groups):
+    """Bring separately aligned clusters into one common attitude.  Only a few
+    coherent groups take part, which is the easy half of the problem and the
+    reason for clustering first."""
+    keys = list(groups)
+    if len(keys) < 2:
+        return {k: np.eye(3) for k in keys}
+    anchor = max(keys, key=lambda k: len(groups[k]))
+    anchor_trees = [cKDTree(P) for P in groups[anchor]]
+    out = {anchor: np.eye(3)}
+    for k in keys:
+        if k == anchor:
+            continue
+        best, bestF = np.inf, np.eye(3)
+        for F in OCTAHEDRAL:
+            c = float(np.mean([_trimmed_cost(P @ F.T, anchor_trees) for P in groups[k]]))
+            if c < best:
+                best, bestF = c, F
+        out[k] = bestF
+    return out
+
+
+def build_reference(clouds, cls, rule_canon, max_ref=10, n_pts=384, seed=0,
+                    n_clusters=None):
+    """Reference attitude for a class: ensembles of its own instances, turned
+    into agreement with each other.
+
+    With `n_clusters` above one the instances are first split by rotation-
+    invariant shape features, aligned within each group, and the groups then
+    aligned to each other, so a stool is never matched against an armchair.
+
+    The rules still have to get the frame right up to an axis swap, because that
+    is all this repairs.  The ensembles come from the first `max_ref` instances,
+    so their own numbers are optimistic; judge the method on the rest."""
+    n_clusters = CLUSTERS_PER_CLASS.get(cls, 1) if n_clusters is None else n_clusters
+    rng = np.random.default_rng(seed)
+    Ps, feats = [], []
+    for X in clouds[:max_ref]:
+        try:
+            R, _ = rule_canon(X, cls)
+            f = invariant_features(Shape(X))
+        except Exception:
+            continue
+        P = normalise_cloud(X)[0] @ R.T
+        if len(P) > n_pts:
+            P = P[rng.choice(len(P), n_pts, replace=False)]
+        Ps.append(P)
+        feats.append(f)
+    if len(Ps) < 3:
+        return None
+
+    F = np.array(feats)
+    mu, sd = F.mean(0), F.std(0) + EPS
+    Fz = (F - mu) / sd
+
+    if n_clusters <= 1:
+        return {"clusters": {0: _joint_align(Ps)}, "centres": np.zeros((1, F.shape[1])),
+                "mu": mu, "sd": sd, "flat": True}
+
+    lab, C = _kmeans(Fz, n_clusters, seed=seed)
+    groups = {}
+    for j in sorted(set(int(v) for v in lab)):
+        idx = [i for i, l in enumerate(lab) if int(l) == j]
+        if len(idx) < 2:                       # a singleton cannot self-align
+            continue
+        groups[j] = _joint_align([Ps[i] for i in idx])
+    if not groups:
+        return {"clusters": {0: _joint_align(Ps)}, "centres": np.zeros((1, F.shape[1])),
+                "mu": mu, "sd": sd, "flat": True}
+    turns = _align_clusters(groups)
+    return {"clusters": {j: [P @ turns[j].T for P in groups[j]] for j in groups},
+            "centres": C, "mu": mu, "sd": sd, "flat": False}
+
+
+def refine_to_reference(P, tree, Q, max_deg=25.0, iters=6, trim=0.7):
+    """Small rotation-only ICP onto one reference member.
+
+    The axis snap repairs a frame that is wrong by a whole axis.  It cannot
+    touch a frame that is wrong by twenty degrees, which is what a mirror plane
+    landing slightly off produces, and that shows up as objects sitting visibly
+    tilted.  This closes that gap, and is capped: a correction larger than
+    `max_deg` means the reference is the wrong shape to be matching against, and
+    is thrown away rather than allowed to drag the frame somewhere worse."""
+    R = np.eye(3)
+    for _ in range(iters):
+        Pr = P @ R.T
+        d, j = tree.query(Pr, workers=-1)
+        keep = d <= max(np.quantile(d, trim), 1e-9)
+        A, B = Pr[keep], Q[j[keep]]
+        if len(A) < 12:
+            break
+        U, _, Vt = np.linalg.svd(A.T @ B)
+        D = np.eye(3)
+        D[2, 2] = np.sign(np.linalg.det(Vt.T @ U.T))
+        M = Vt.T @ D @ U.T
+        R = M @ R
+        if math.degrees(math.acos(float(np.clip((np.trace(M) - 1) / 2, -1, 1)))) < 0.05:
+            break
+    ang = math.degrees(math.acos(float(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+    return R if ang <= max_deg else np.eye(3)
+
+
+def save_references(path, refs, extra=None):
+    """Write the built references to a .npz so they never have to be rebuilt.
+
+    The file carries the clouds of every cluster plus the feature statistics
+    used to assign a new instance to one, and it records whether the references
+    were built with the principal-axis pre-canonicalisation on.  Aligning a new
+    cloud under a different setting from the one the references were built with
+    would silently mis-assign, so the setting travels with the file."""
+    arrays, meta = {}, {"pca_first": bool(PCA_FIRST), "classes": {}}
+    for cls, ref in (refs or {}).items():
+        if not ref or not ref.get("clusters"):
+            continue
+        meta["classes"][cls] = {"flat": bool(ref.get("flat", False)),
+                                "clusters": {str(j): len(Ps)
+                                             for j, Ps in ref["clusters"].items()}}
+        arrays[f"{cls}|centres"] = np.asarray(ref["centres"], np.float32)
+        arrays[f"{cls}|mu"] = np.asarray(ref["mu"], np.float32)
+        arrays[f"{cls}|sd"] = np.asarray(ref["sd"], np.float32)
+        for j, Ps in ref["clusters"].items():
+            for i, P in enumerate(Ps):
+                arrays[f"{cls}|c{j}|{i}"] = np.asarray(P, np.float32)
+    if extra:
+        meta.update(extra)
+    arrays["__meta__"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
+    np.savez_compressed(path, **arrays)
+    return meta
+
+
+def load_references(path):
+    """Read references written by save_references.  Returns (refs, meta)."""
+    z = np.load(path, allow_pickle=False)
+    meta = json.loads(bytes(z["__meta__"]).decode())
+    refs = {}
+    for cls, m in meta["classes"].items():
+        clusters = {}
+        for j, n in m["clusters"].items():
+            clusters[int(j)] = [np.asarray(z[f"{cls}|c{j}|{i}"], float) for i in range(n)]
+        refs[cls] = {"clusters": clusters,
+                     "centres": np.asarray(z[f"{cls}|centres"], float),
+                     "mu": np.asarray(z[f"{cls}|mu"], float),
+                     "sd": np.asarray(z[f"{cls}|sd"], float),
+                     "flat": bool(m["flat"])}
+    return refs, meta
+
+
+def make_canonicaliser(references=None, refine=True, refine_classes=None):
+    """Bind class references to the pipeline.  Without them this is the plain
+    rule-based canonicaliser."""
+    store = {}
+    for c, ref in (references or {}).items():
+        if not ref or not ref.get("clusters"):
+            continue
+        store[c] = {"trees": {j: [cKDTree(P) for P in Ps]
+                              for j, Ps in ref["clusters"].items()},
+                    "pts": ref["clusters"],
+                    "centres": ref["centres"], "mu": ref["mu"], "sd": ref["sd"],
+                    "flat": ref.get("flat", False)}
+
+    def canon(X, cls):
+        R, info = canonicalise(X, cls)
+        ref = store.get(cls)
+        if not ref:
+            return R, info
+
+        keys = sorted(ref["trees"])
+        if ref["flat"] or len(keys) == 1:
+            j = keys[0]
+        else:                                  # match against this shape's own kind
+            try:
+                f = (invariant_features(Shape(X)) - ref["mu"]) / ref["sd"]
+                j = keys[int(np.argmin([((ref["centres"][k] - f) ** 2).sum()
+                                        if k < len(ref["centres"]) else np.inf
+                                        for k in keys]))]
+            except Exception:
+                j = keys[0]
+        ens, pl = ref["trees"][j], ref["pts"][j]
+
+        P = normalise_cloud(X)[0] @ R.T
+        F = snap_to_reference(P, ens)
+        R = F @ R
+        tweak = 0.0
+        if refine and (refine_classes is None or cls in refine_classes):
+            Pf = P @ F.T
+            k = int(np.argmin([_one_way_chamfer(Pf, t) for t in ens]))
+            M = refine_to_reference(Pf, ens[k], pl[k])
+            R = M @ R
+            tweak = math.degrees(math.acos(float(np.clip((np.trace(M) - 1) / 2, -1, 1))))
+        info = dict(info, cluster=int(j), snapped=bool(not np.allclose(F, np.eye(3))),
+                    refined_deg=tweak)
+        return R, info
+
+    return canon
+
+
+def rule_generic(shape):
+    """Fallback when the label is unknown: strongest mirror plane, support cue
+    for up, longest remaining direction for forward."""
+    X = shape.X
+    n, mscore = best_mirror(shape)
+    up, _ = _circle_argmax(X, n, lambda d: support_score(X, d))
+    fwd = unit(np.cross(n, up))
+    lo, hi = end_spread(X, fwd)
+    if lo < hi:
+        fwd = -fwd
+    return frame_from(fwd, up), {"mirror_score": mscore, "symmetry": "I"}
+
+
+RULES = {"airplane": rule_airplane, "car": rule_car, "chair": rule_chair,
+         "table": rule_table, "bowl": rule_bowl, "laptop": rule_laptop,
+         "bed": rule_bed, "bottle": rule_bottle, "guitar": rule_guitar,
+         "sofa": rule_sofa, "bathtub": rule_bathtub, "bench": rule_bench,
+         "bookshelf": rule_bookshelf, "door": rule_door,
+         "flower_pot": rule_flower_pot, "keyboard": rule_keyboard,
+         "lamp": rule_lamp, "monitor": rule_monitor, "piano": rule_piano,
+         "toilet": rule_toilet, "wardrobe": rule_wardrobe}
+
+
+PCA_FIRST = True        # see canonicalise(); cleared by --no-pca-first
+
+
+def canonicalise(X, cls):
+    """Full pipeline for one cloud: label selects the rule, the rule returns a
+    canonical rotation and the symmetry group that rotation is defined up to.
+
+    With PCA_FIRST the cloud is first put into its principal-axis frame and the
+    rule is applied to *that*.  Every pose of a given cloud collapses to the
+    same principal frame, so the rule sees one fixed input and cannot answer
+    differently: the composite is exactly pose-invariant and stability is zero
+    by construction rather than by measurement.  The canonical pose is still
+    whatever the rule decides -- PCA only removes the arbitrary input attitude
+    before the rule looks at it, it does not get a vote on the answer.
+
+    Worth being clear about what this does and does not buy.  It fixes the
+    output against *rotation* of the input.  It does not fix it against the
+    points themselves moving: principal axes are ill-conditioned when two
+    eigenvalues are close, which is the normal state of a bowl or a square
+    table, so resampling or noise still moves the frame.  That shows up under
+    --robustness, not here.  It also does not make the rules any more correct;
+    an instance whose cue sits near its decision boundary now falls the same
+    side every time instead of wavering, so consistency stops drifting between
+    runs at whatever value it already had."""
+    pre = np.eye(3)
+    if PCA_FIRST:
+        pre, _ = pca_baseline(X)
+        X = normalise_cloud(X)[0] @ pre.T
+    shape = Shape(X)
+    rule = RULES.get(cls, rule_generic)
+    try:
+        R, info = rule(shape)
+    except Exception as exc:                      # never lose a whole run to one cloud
+        R, info = pca_baseline(X)
+        info = dict(info)
+        info["fallback"] = f"{type(exc).__name__}: {exc}"
+    if not is_rotation(R):                        # numerical guard
+        U, _, Vt = np.linalg.svd(R)
+        R = U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+    info.setdefault("symmetry", DEFAULT_SYMMETRY.get(cls, "I"))
+    return R @ pre, info
+
+
+def pca_baseline(X, cls=None):
+    """Reference canonicaliser: principal axes with third-moment sign fixing.
+    Included so the class-conditional rules have something to be compared to."""
+    Y, _, _ = normalise_cloud(X)
+    w, V = principal_axes(Y)
+    A = V.T.copy()
+    for i in range(3):
+        if float(((Y @ A[i]) ** 3).mean()) < 0:
+            A[i] *= -1
+    if np.linalg.det(A) < 0:
+        A[2] *= -1
+    return A, {"symmetry": "I"}
+
+
+# ----------------------------------------------------------------------------
+# Symmetry groups and rotation metrics
+#
+# If S is a rotational self-map of the canonical shape then R and S R produce
+# the same canonical cloud, so distances are taken modulo left multiplication
+# by the group.  For a surface of revolution the minimisation over the group is
+# available in closed form, so no sampling error enters the metric.
+# ----------------------------------------------------------------------------
+
+def _rz(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _rx(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], float)
+
+
+FINITE_GROUPS = {
+    "I": [np.eye(3)],
+    # 180 deg about canonical x swaps up with down and left with right.  For a
+    # shelf unit that is a plain open box -- a flat panel top and bottom, alike
+    # -- that is a genuine self-map, so the frame is only ever determined up to
+    # it and the metrics must not charge for it.
+    "C2x": [np.eye(3), _rx(np.pi)],
+    "C2z": [np.eye(3), _rz(np.pi)],
+    "C3z": [_rz(2 * k * np.pi / 3) for k in range(3)],
+    "C4z": [_rz(k * np.pi / 2) for k in range(4)],
+    "C6z": [_rz(k * np.pi / 3) for k in range(6)],
+}
+
+
+def align_in_group(R, M, group):
+    """The group element g minimising the angle between g R and M, applied."""
+    C = R @ M.T
+    if group == "Cinfz":
+        theta = math.atan2(C[0, 1] - C[1, 0], C[0, 0] + C[1, 1])
+        return _rz(theta) @ R
+    best, best_tr = R, -np.inf
+    for g in FINITE_GROUPS.get(group, FINITE_GROUPS["I"]):
+        tr = np.trace(g @ C)
+        if tr > best_tr:
+            best_tr, best = tr, g @ R
+    return best
+
+
+def geodesic_deg(A, B):
+    c = (np.trace(A @ B.T) - 1.0) / 2.0
+    return float(math.degrees(math.acos(float(np.clip(c, -1.0, 1.0)))))
+
+
+def group_distance_deg(A, B, group):
+    """Geodesic distance on SO(3) modulo the symmetry group."""
+    if group == "Cinfz":
+        C = A @ B.T
+        tr = math.hypot(C[0, 0] + C[1, 1], C[0, 1] - C[1, 0]) + C[2, 2]
+        return float(math.degrees(math.acos(float(np.clip((tr - 1.0) / 2.0, -1.0, 1.0)))))
+    return min(geodesic_deg(g @ A, B) for g in FINITE_GROUPS.get(group, FINITE_GROUPS["I"]))
+
+
+def project_so3(M):
+    U, _, Vt = np.linalg.svd(M)
+    D = np.diag([1.0, 1.0, float(np.sign(np.linalg.det(U @ Vt)))])
+    return U @ D @ Vt
+
+
+def dispersion_deg(rotations, groups, iters=15):
+    """RMS angular deviation from the symmetry-aware chordal mean, in degrees.
+
+    With the trivial group this is exactly the usual chordal-mean dispersion;
+    with a non-trivial group each sample is first moved to its representative
+    closest to the current mean, which is what stops a bowl from being charged
+    for a rotation about its own axis."""
+    rotations = [np.asarray(R, float) for R in rotations]
+    if isinstance(groups, str):
+        groups = [groups] * len(rotations)
+    if len(rotations) == 1:
+        return 0.0, np.zeros(1), rotations[0]
+    M = rotations[0].copy()
+    for _ in range(iters):
+        aligned = [align_in_group(R, M, g) for R, g in zip(rotations, groups)]
+        M_new = project_so3(np.mean(aligned, axis=0))
+        if geodesic_deg(M_new, M) < 1e-7:
+            M = M_new
+            break
+        M = M_new
+    angles = np.array([group_distance_deg(R, M, g) for R, g in zip(rotations, groups)])
+    return float(np.sqrt(np.mean(angles ** 2))), angles, M
+
+
+# ----------------------------------------------------------------------------
+# Rotation-invariant descriptors and a training-free label step
+# ----------------------------------------------------------------------------
+
+def invariant_features(shape):
+    """Semantic descriptors that do not change when the cloud is rotated: every
+    one is either a spectral quantity or a maximum over all directions."""
+    X, w = shape.X, shape.w
+    w = np.maximum(w, EPS)
+    mirror = float(shape.mirror_score(shape.cands).max())
+    rot = float(max(shape.rot_score(d) for d in shape.cands))
+    plate = max(slab_peak(X, d, width=0.07, ends_only=True)[0] for d in shape.cands)
+    mid_plate = max(slab_peak(X, d, width=0.07, ends_only=False)[0] for d in shape.cands)
+    supp = max(support_score(X, d) for d in np.vstack([shape.cands, -shape.cands]))
+    r = np.sqrt((X ** 2).sum(1))
+    return np.array([
+        w[1] / w[0], w[2] / w[0], w[2] / max(w[1], EPS),
+        mirror, rot, plate, mid_plate, min(supp, 12.0),
+        float(r.std() / (r.mean() + EPS)),
+        float(((r - r.mean()) ** 3).mean() / (r.std() ** 3 + EPS)),
+    ], float)
+
+
+FEATURE_NAMES = ["lam2/lam1", "lam3/lam1", "lam3/lam2", "mirror", "revolution",
+                 "end_plate", "any_plate", "support", "radial_cv", "radial_skew"]
+
+
+def classify_leave_one_out(features, labels):
+    """Nearest class-prototype in standardised feature space, prototypes being
+    medians of the other instances.  No fitted parameters are carried over from
+    anywhere: the prototypes are summary statistics of the data at hand."""
+    F = np.asarray(features, float)
+    F = (F - F.mean(0)) / (F.std(0) + EPS)
+    labels = np.asarray(labels)
+    classes = sorted(set(labels.tolist()))
+    pred = []
+    for i in range(len(F)):
+        best, best_d = None, np.inf
+        for c in classes:
+            m = (labels == c)
+            m[i] = False
+            if not m.any():
+                continue
+            d = float(np.abs(F[i] - np.median(F[m], axis=0)).sum())
+            if d < best_d:
+                best_d, best = d, c
+        pred.append(best)
+    return np.array(pred)
+
+
+# ----------------------------------------------------------------------------
+# Evaluation
+# ----------------------------------------------------------------------------
+
+def stability_of_instance(X, cls, canon, k, rng):
+    """Equivariance test.  The estimator should satisfy f(X A^T) = f(X) A^T, so
+    R_k A_k is the same rotation for every random A_k when the estimator is
+    perfectly stable.  Nothing is cached between rotations: every canonical
+    frame is recomputed from the rotated points."""
+    mats = [np.eye(3)] + random_rotations(k, rng)
+    frames, groups = [], []
+    for A in mats:
+        R, info = canon(X @ A.T, cls)
+        frames.append(R @ A)
+        groups.append(info.get("symmetry", "I"))
+    grp_free = dispersion_deg(frames, "I")[0]
+    grp_quot = dispersion_deg(frames, groups)[0]
+    # The frame handed to the consistency metric is the one recovered from a
+    # RANDOMLY ROTATED copy, with the known rotation undone -- not the one from
+    # the pose the dataset happened to store.  Measuring consistency on the
+    # stored pose feeds every rule the same easy input every run, so a cue
+    # sitting near its decision boundary falls the same way each time.  A random
+    # pose samples around that boundary and is what the object would arrive as
+    # in use.
+    i = 1 if len(frames) > 1 else 0
+    return grp_free, grp_quot, frames[i], groups[i]
+
+
+def evaluate(dataset, canon, k_rot, seed, use_pred_labels=False, want_features=True,
+             baseline=False):
+    results, feats, labels = {}, [], []
+    for cls in [c for c in CLASS_ORDER if c in dataset]:
+        clouds, ids = dataset[cls]
+        rng = np.random.default_rng(seed + 977 * (CLASS_ORDER.index(cls)
+                                                      if cls in CLASS_ORDER else 7))
+        t0 = time.time()
+
+        stab_raw, stab_sym, frames, groups, kept = [], [], [], [], []
+        for idx, X in enumerate(clouds):
+            try:
+                a, b, R0, g0 = stability_of_instance(X, cls, canon, k_rot, rng)
+            except Exception as exc:
+                print(f"  [warn] {cls} instance {ids[idx]} skipped: {exc}")
+                continue
+            stab_raw.append(a)
+            stab_sym.append(b)
+            frames.append(R0)
+            groups.append(g0)
+            kept.append(ids[idx])
+        if not frames:
+            print(f"  [warn] no usable instances for {cls}")
+            continue
+        ids = kept
+
+        cons_raw = dispersion_deg(frames, "I")
+        cons_sym = dispersion_deg(frames, groups)
+
+        if want_features and not baseline:
+            for X in clouds:
+                try:
+                    feats.append(invariant_features(Shape(X)))
+                    labels.append(cls)
+                except Exception:
+                    pass
+
+        results[cls] = {
+            "n_instances": len(frames),
+            "stability_raw_deg": float(np.mean(stab_raw)),
+            "stability_sym_deg": float(np.mean(stab_sym)),
+            "stability_sym_median_deg": float(np.median(stab_sym)),
+            "consistency_raw_deg": float(cons_raw[0]),
+            "consistency_sym_deg": float(cons_sym[0]),
+            "consistency_sym_median_deg": float(np.median(cons_sym[1])),
+            "consistency_within10": float(np.mean(np.asarray(cons_sym[1]) < 10.0)),
+            "stability_within10": float(np.mean(np.asarray(stab_sym) < 10.0)),
+            "per_instance_consistency_deg": cons_sym[1].tolist(),
+            "symmetry_groups": groups,
+            "mean_frame": cons_sym[2].tolist(),
+            "seconds": time.time() - t0,
+            "ids": ids,
+        }
+        print(f"  {cls:9s} n={len(frames):3d}  "
+              f"stability {np.mean(stab_sym):7.3f} deg   "
+              f"consistency {cons_sym[0]:7.3f} deg   "
+              f"({time.time() - t0:.1f}s)")
+    return results, (np.array(feats) if feats else None), labels
+
+
+def ground_truth_error(dataset, canon):
+    """Only meaningful for procedural shapes, which are built in the canonical
+    pose: the estimated frame should then be the identity, up to symmetry."""
+    out = {}
+    for cls in [c for c in CLASS_ORDER if c in dataset]:
+        errs = []
+        for X in dataset[cls][0]:
+            try:
+                R, info = canon(X, cls)
+            except Exception:
+                continue
+            errs.append(group_distance_deg(R, np.eye(3), info.get("symmetry", "I")))
+        if not errs:
+            continue
+        out[cls] = {"mean_deg": float(np.mean(errs)),
+                    "median_deg": float(np.median(errs)),
+                    "frac_within_10deg": float(np.mean(np.array(errs) < 10.0))}
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Robustness of the canonical frame to input degradation
+#
+# Stability answers "does the frame follow the object when the object turns".
+# Robustness answers "does the frame survive a cloud that is noisy, sparse, or
+# incomplete".  A canonicaliser can be perfectly equivariant and still useless
+# if 1% jitter moves the frame by 40 degrees, so both are reported.
+# ----------------------------------------------------------------------------
+
+PERTURBATIONS = ("noise 1%", "noise 2%", "decimate 50%", "crop 15%")
+
+
+def perturb_cloud(X, kind, rng):
+    """Degrade a cloud.  Noise is expressed as a fraction of the RMS radius, so
+    the level means the same thing whatever the object's absolute size is."""
+    Y = X - X.mean(axis=0)
+    rms = math.sqrt(float((Y ** 2).sum(axis=1).mean()))
+    if kind.startswith("noise"):
+        frac = float(kind.split()[1].rstrip("%")) / 100.0
+        return X + rng.normal(scale=frac * rms, size=X.shape)
+    if kind.startswith("decimate"):
+        frac = float(kind.split()[1].rstrip("%")) / 100.0
+        keep = max(24, int(round(len(X) * frac)))
+        return X[rng.choice(len(X), keep, replace=False)]
+    if kind.startswith("crop"):
+        frac = float(kind.split()[1].rstrip("%")) / 100.0
+        d = rng.normal(size=3)
+        t = Y @ (d / np.linalg.norm(d))
+        return X[t > np.quantile(t, frac)]          # slice off one side
+    raise ValueError(kind)
+
+
+def robustness(dataset, canon, seed, kinds=PERTURBATIONS):
+    """Frame shift caused by each degradation, modulo the symmetry group.
+
+    The degraded cloud is also randomly rotated, so the number is the error a
+    downstream network would actually see: canonicalise a clean cloud, then
+    canonicalise a damaged copy in an unrelated pose, and compare the two
+    frames after undoing the known rotation."""
+    out = {}
+    for cls in [c for c in CLASS_ORDER if c in dataset]:
+        rng = np.random.default_rng(seed + 5099 * (CLASS_ORDER.index(cls) + 1))
+        per_kind = {k: [] for k in kinds}
+        for X in dataset[cls][0]:
+            try:
+                R0, info = canon(X, cls)
+            except Exception:
+                continue
+            g = info.get("symmetry", "I")
+            for k in kinds:
+                try:
+                    Y = perturb_cloud(X, k, rng)
+                    A = random_rotations(1, rng)[0]
+                    R, _ = canon(Y @ A.T, cls)
+                    per_kind[k].append(group_distance_deg(R @ A, R0, g))
+                except Exception:
+                    continue
+        if any(per_kind.values()):
+            out[cls] = {k: {"mean_deg": float(np.mean(v)),
+                            "median_deg": float(np.median(v)),
+                            "frac_within_10deg": float(np.mean(np.array(v) < 10.0))}
+                        for k, v in per_kind.items() if v}
+    return out
+
+
+def print_robustness(rob, kinds=PERTURBATIONS):
+    if not rob:
+        return
+    print("\nROBUSTNESS: frame shift under input degradation, modulo symmetry")
+    print("-" * 88)
+    print(f"{'class':10s}" + "".join(f"{k:>19s}" for k in kinds))
+    print(f"{'':10s}" + "".join(f"{'median / <10 deg':>19s}" for _ in kinds))
+    print("-" * 88)
+    for cls, r in rob.items():
+        print(f"{cls:10s}" + "".join(
+            f"{r[k]['median_deg']:>11.2f} /{100 * r[k]['frac_within_10deg']:4.0f}%"
+            if k in r else f"{'-':>19s}" for k in kinds))
+    print("-" * 88)
+    print("each degraded cloud is also randomly rotated.  The two numbers matter")
+    print("separately: cropping is bimodal, so a small median can hide a minority")
+    print("of clouds where the cut removed the feature the rule depends on")
+
+
+# ----------------------------------------------------------------------------
+# Figures
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Is the dataset pre-aligned?  A diagnostic, not a metric.
+#
+# Consistency is the spread of the predicted rotations across instances, and it
+# only means "do the rules agree" when every instance arrives in the same pose.
+# If the stored clouds are already in arbitrary poses then each R must undo a
+# different rotation, the spread is large whatever the rules do, and the number
+# says nothing.  Chamfer distance between whole clouds does not care about that,
+# so comparing three levels of it separates the two cases.
+# ----------------------------------------------------------------------------
+
+def chamfer(A, B):
+    ta, tb = cKDTree(A), cKDTree(B)
+    da, _ = tb.query(A, workers=-1)
+    db, _ = ta.query(B, workers=-1)
+    return 0.5 * (float(da.mean()) + float(db.mean()))
+
+
+def mean_pair_chamfer(clouds, n_pairs, rng):
+    n = len(clouds)
+    if n < 2:
+        return float("nan")
+    out = []
+    for _ in range(n_pairs):
+        i, j = rng.choice(n, 2, replace=False)
+        out.append(chamfer(clouds[i], clouds[j]))
+    return float(np.mean(out))
+
+
+def diagnose_alignment(dataset, canon, seed, n_pairs=40):
+    """Per class, mean Chamfer between pairs of clouds at three stages:
+
+      stored     as they sit in the dataset
+      scrambled  each cloud given its own random rotation -- the level that
+                 means 'these are definitely not mutually aligned'
+      canonical  after the pipeline's rotation
+
+    stored close to scrambled  -> the dataset is not pre-aligned
+    canonical well below both  -> the rules are aligning the class
+    """
+    out = {}
+    for cls in [c for c in CLASS_ORDER if c in dataset]:
+        rng = np.random.default_rng(seed + 811 * (CLASS_ORDER.index(cls) + 1))
+        stored, scrambled, canonical = [], [], []
+        for X in dataset[cls][0]:
+            Y = normalise_cloud(X)[0]
+            stored.append(Y)
+            scrambled.append(Y @ random_rotations(1, rng)[0].T)
+            try:
+                R, _ = canon(X, cls)
+                canonical.append(Y @ R.T)
+            except Exception:
+                pass
+        if len(stored) < 2:
+            continue
+        out[cls] = {
+            "stored": mean_pair_chamfer(stored, n_pairs, np.random.default_rng(seed)),
+            "scrambled": mean_pair_chamfer(scrambled, n_pairs, np.random.default_rng(seed)),
+            "canonical": mean_pair_chamfer(canonical, n_pairs, np.random.default_rng(seed)),
+        }
+    return out
+
+
+def print_diagnosis(diag):
+    if not diag:
+        return
+    print("\nDATASET ALIGNMENT CHECK (mean Chamfer between pairs of clouds)")
+    print("-" * 78)
+    print(f"{'class':10s}{'stored':>12s}{'scrambled':>12s}{'canonical':>12s}   verdict")
+    print("-" * 78)
+    for cls, d in diag.items():
+        s, r, c = d["stored"], d["scrambled"], d["canonical"]
+        aligned = s < 0.65 * r
+        helped = c < 0.85 * s
+        if aligned and c <= 1.15 * s:
+            v = "pre-aligned; rules keep it"
+        elif aligned:
+            v = "pre-aligned; RULES BREAK IT"
+        elif helped:
+            v = "not pre-aligned; rules align it"
+        else:
+            v = "not pre-aligned; rules do not align it"
+        print(f"{cls:10s}{s:12.4f}{r:12.4f}{c:12.4f}   {v}")
+    print("-" * 78)
+    print("consistency is only meaningful when 'stored' is well below 'scrambled'.")
+    print("if it is not, the instances were saved in arbitrary poses and the")
+    print("spread of the predicted rotations measures the data, not the method.")
+
+
+# ----------------------------------------------------------------------------
+# Rendering
+#
+# A raw 3-D scatter of 1024 points reads as a cloud of dots, which makes it hard
+# to see whether two canonical frames actually agree.  These helpers project the
+# cloud themselves, shade each point by its estimated surface normal and draw
+# the splats back to front, so the object reads as a solid surface.
+# ----------------------------------------------------------------------------
+
+RENDER_BASE = np.array([0.42, 0.48, 0.58])       # slate blue, like a CAD render
+
+# Viewing angle per class, chosen so that the failure each class actually has is
+# visible.  Aircraft and cars fail by turning end for end, and a three-quarter
+# view hides exactly that, so both are drawn from the side.
+CLASS_VIEW = {"airplane": (10.0, -90.0), "car": (8.0, -90.0),
+              "chair": (14.0, -62.0), "table": (16.0, -60.0), "bowl": (18.0, -58.0)}
+
+
+def camera_basis(elev, azim):
+    e, a = math.radians(elev), math.radians(azim)
+    right = np.array([-math.sin(a), math.cos(a), 0.0])
+    up = np.array([-math.sin(e) * math.cos(a), -math.sin(e) * math.sin(a), math.cos(e)])
+    fwd = np.array([math.cos(e) * math.cos(a), math.cos(e) * math.sin(a), math.sin(e)])
+    return right, up, fwd
+
+
+def surface_normals(X, fwd, k=18, smooth=2):
+    """Local-PCA normals, turned towards the camera and then smoothed.
+
+    Turning them towards the camera avoids the speckle a raw orientation gives
+    on thin parts such as chair legs, where neighbouring points would otherwise
+    disagree about which side is outside."""
+    tree = cKDTree(X)
+    _, idx = tree.query(X, k=min(k, len(X)), workers=-1)
+    N = np.empty_like(X)
+    for i, nb in enumerate(np.atleast_2d(idx)):
+        _, V = np.linalg.eigh(np.cov(X[nb].T))
+        N[i] = V[:, 0]
+    N *= np.sign(N @ fwd)[:, None]
+    for _ in range(smooth):
+        N = N[idx].mean(axis=1)
+        N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9)
+        N *= np.sign(N @ fwd)[:, None]
+    nn, _ = tree.query(X, k=2, workers=-1)
+    return N, float(np.median(nn[:, 1]))
+
+
+def render_cloud(ax, fig, X, elev=18, azim=-58, base=RENDER_BASE, shadow=True,
+                 cover=2.1, lim=None):
+    """Draw one cloud as a shaded solid.  `cover` is the splat radius in units
+    of the point spacing: about 2 closes the surface without erasing detail."""
+    right, up, fwd = camera_basis(elev, azim)
+    N, spacing = surface_normals(X, fwd)
+    u, v, d = X @ right, X @ up, X @ fwd
+
+    L = 0.55 * (-right) + 0.70 * up + 0.75 * fwd
+    L /= np.linalg.norm(L)
+    H = L + fwd
+    H /= np.linalg.norm(H)
+    inten = 0.46 + 0.54 * np.clip(N @ L, 0.0, 1.0)
+    spec = np.clip(N @ H, 0.0, 1.0) ** 40
+    col = np.clip(base[None, :] * inten[:, None] + 0.30 * spec[:, None], 0.0, 1.0)
+
+    r = lim if lim is not None else 1.08 * max(np.abs(u).max(), np.abs(v).max())
+    ax.set_xlim(-r, r)
+    ax.set_ylim(-r * 0.95, r * 1.05)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    w_in = fig.get_size_inches()[0] * ax.get_position().width
+    s = math.pi * (cover * spacing * (w_in * 72.0) / (2 * r)) ** 2
+    order = np.argsort(d)
+    if shadow:
+        S = X.copy()
+        S[:, 2] = X[:, 2].min() - 0.03
+        ax.scatter(S @ right, S @ up, s=s * 1.3, c=[[0.70, 0.72, 0.76]],
+                   alpha=0.05, linewidths=0)
+    ax.scatter(u[order], v[order], s=s, c=col[order], linewidths=0, marker="o")
+
+
+# ----------------------------------------------------------------------------
+# Figures
+# ----------------------------------------------------------------------------
+
+def make_figures(dataset, canon, out_dir, seed, n_show=16, n_cols=8, n_rot=5):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for cls in [c for c in CLASS_ORDER if c in dataset]:
+        clouds, ids = dataset[cls]
+        m = min(n_show, len(clouds))
+        elev, azim = CLASS_VIEW.get(cls, (18.0, -58.0))
+        rng = np.random.default_rng(seed + 31 * (CLASS_ORDER.index(cls) + 1))
+
+        # --- consistency ------------------------------------------------------
+        # Inputs are randomly rotated, matching how consistency is measured: the
+        # stored dataset pose is one convenient special case, not what an object
+        # looks like when it arrives.
+        ins, outs = [], []
+        for X in clouds[:m]:
+            A = random_rotations(1, rng)[0]
+            Xr = normalise_cloud(X @ A.T)[0]
+            R, _ = canon(X @ A.T, cls)
+            ins.append(Xr)
+            outs.append(Xr @ R.T)
+
+        blocks = int(math.ceil(m / n_cols))
+        fig, axes = plt.subplots(2 * blocks, n_cols,
+                                 figsize=(2.7 * n_cols, 3.0 * 2 * blocks))
+        fig.patch.set_facecolor("white")
+        axes = np.atleast_2d(axes)
+        for k in range(2 * blocks * n_cols):
+            axes[k // n_cols, k % n_cols].axis("off")
+        for i in range(m):
+            b, c = i // n_cols, i % n_cols
+            render_cloud(axes[2 * b, c], fig, ins[i], elev=elev, azim=azim, lim=1.7)
+            render_cloud(axes[2 * b + 1, c], fig, outs[i], elev=elev, azim=azim, lim=1.7)
+            axes[2 * b, c].set_title(str(ids[i])[:12], fontsize=8)
+        for b in range(blocks):
+            axes[2 * b, 0].text(-0.10, 0.5, "RANDOM INPUT", rotation=90,
+                                transform=axes[2 * b, 0].transAxes, va="center",
+                                ha="right", fontsize=9, weight="bold")
+            axes[2 * b + 1, 0].text(-0.10, 0.5, "CANONICAL", rotation=90,
+                                    transform=axes[2 * b + 1, 0].transAxes,
+                                    va="center", ha="right", fontsize=9, weight="bold")
+        fig.suptitle(f"{cls}: consistency -- {m} instances, each from a random pose",
+                     fontsize=13, weight="bold")
+        fig.tight_layout(rect=(0.02, 0, 1, 0.96))
+        fig.savefig(out_dir / f"{cls}_consistency.png", dpi=110)
+        plt.close(fig)
+        print(f"  saved {out_dir / f'{cls}_consistency.png'}")
+
+        # --- stability: one instance seen from several poses -------------------
+        X = clouds[0]
+        fig, axes = plt.subplots(2, n_rot, figsize=(2.9 * n_rot, 6.2))
+        fig.patch.set_facecolor("white")
+        axes = np.atleast_2d(axes)
+        for j, A in enumerate(random_rotations(n_rot, rng)):
+            Xr = normalise_cloud(X @ A.T)[0]
+            R, _ = canon(X @ A.T, cls)
+            render_cloud(axes[0, j], fig, Xr, lim=1.7, elev=elev, azim=azim)
+            render_cloud(axes[1, j], fig, Xr @ R.T, lim=1.7, elev=elev, azim=azim)
+        axes[0, 0].text(-0.08, 0.5, "ROTATED INPUT", transform=axes[0, 0].transAxes,
+                        rotation=90, va="center", ha="right", fontsize=10, weight="bold")
+        axes[1, 0].text(-0.08, 0.5, "CANONICAL", transform=axes[1, 0].transAxes,
+                        rotation=90, va="center", ha="right", fontsize=10, weight="bold")
+        fig.suptitle(f"{cls}: stability -- one instance, {n_rot} random input poses",
+                     fontsize=13, weight="bold")
+        fig.tight_layout(rect=(0.02, 0, 1, 0.95))
+        fig.savefig(out_dir / f"{cls}_stability.png", dpi=110)
+        plt.close(fig)
+        print(f"  saved {out_dir / f'{cls}_stability.png'}")
+
+
+# ----------------------------------------------------------------------------
+# Report
+# ----------------------------------------------------------------------------
+
+def print_table(results, title):
+    print(f"\n{title}")
+    print("-" * 78)
+    print(f"{'class':10s} {'n':>4s} {'stab raw':>9s} {'stab sym':>9s}"
+          f" {'cons raw':>9s} {'cons sym':>9s} {'cons med':>9s} {'<10deg':>7s} {'group':>7s}")
+    print("-" * 86)
+    for cls, r in results.items():
+        grp = max(set(r["symmetry_groups"]), key=r["symmetry_groups"].count)
+        print(f"{cls:10s} {r['n_instances']:4d} {r['stability_raw_deg']:9.3f} "
+              f"{r['stability_sym_deg']:9.3f} "
+              f"{r['consistency_raw_deg']:9.3f} {r['consistency_sym_deg']:9.3f} "
+              f"{r['consistency_sym_median_deg']:9.3f} "
+              f"{100 * r.get('consistency_within10', float('nan')):6.0f}% {grp:>7s}")
+    print("-" * 86)
+    print(f"{'MEAN':10s} {'':4s} "
+          f"{np.mean([r['stability_raw_deg'] for r in results.values()]):9.3f} "
+          f"{np.mean([r['stability_sym_deg'] for r in results.values()]):9.3f} "
+          f"{np.mean([r['consistency_raw_deg'] for r in results.values()]):9.3f} "
+          f"{np.mean([r['consistency_sym_deg'] for r in results.values()]):9.3f} "
+          f"{np.mean([r['consistency_sym_median_deg'] for r in results.values()]):9.3f} "
+          f"{100 * np.mean([r.get('consistency_within10', 0.0) for r in results.values()]):6.0f}%")
+    print("sym = modulo the detected symmetry group.  RMS squares the errors, so one")
+    print("inverted instance in 25 shows up as 36 degrees: read the median too.")
+
+
+def write_latex(path, results, baseline, gt, rob, meta):
+    """booktabs tables ready to \\input into the capstone report."""
+    def grp(r):
+        g = max(set(r["symmetry_groups"]), key=r["symmetry_groups"].count)
+        return {"I": "$\\mathbb{1}$", "C2z": "$C_2$", "C3z": "$C_3$",
+                "C4z": "$C_4$", "C6z": "$C_6$", "Cinfz": "$C_\\infty$"}.get(g, g)
+
+    L = ["% generated by geo_canon.py -- " + json.dumps(meta),
+         "\\begin{table}[htbp]", "  \\centering",
+         "  \\caption{Stability and consistency of the canonical frame, in degrees. "
+         "Raw columns are the plain SO(3) dispersion; symmetry columns quotient out "
+         "the detected rotational self-symmetry group.}",
+         "  \\label{tab:canon-metrics}",
+         "  \\begin{tabular}{lrrrrrc}", "    \\toprule",
+         "    Class & $n$ & \\multicolumn{2}{c}{Stability} & "
+         "\\multicolumn{2}{c}{Consistency} & Group \\\\",
+         "    \\cmidrule(lr){3-4}\\cmidrule(lr){5-6}",
+         "     & & raw & sym. & raw & sym. & \\\\", "    \\midrule"]
+    for cls, r in results.items():
+        L.append(f"    {cls.capitalize()} & {r['n_instances']} & "
+                 f"{r['stability_raw_deg']:.2f} & {r['stability_sym_deg']:.2f} & "
+                 f"{r['consistency_raw_deg']:.2f} & {r['consistency_sym_deg']:.2f} & "
+                 f"{grp(r)} \\\\")
+    if results:
+        L += ["    \\midrule",
+              f"    Mean & & {np.mean([r['stability_raw_deg'] for r in results.values()]):.2f} & "
+              f"{np.mean([r['stability_sym_deg'] for r in results.values()]):.2f} & "
+              f"{np.mean([r['consistency_raw_deg'] for r in results.values()]):.2f} & "
+              f"{np.mean([r['consistency_sym_deg'] for r in results.values()]):.2f} & \\\\"]
+    if baseline:
+        L += ["    \\midrule",
+              "    \\multicolumn{7}{l}{\\emph{PCA baseline}} \\\\"]
+        for cls, r in baseline.items():
+            L.append(f"    {cls.capitalize()} & {r['n_instances']} & "
+                     f"{r['stability_raw_deg']:.2f} & {r['stability_sym_deg']:.2f} & "
+                     f"{r['consistency_raw_deg']:.2f} & {r['consistency_sym_deg']:.2f} & "
+                     f"{grp(r)} \\\\")
+    L += ["    \\bottomrule", "  \\end{tabular}", "\\end{table}", ""]
+
+    if rob:
+        kinds = list(next(iter(rob.values())).keys())
+        L += ["\\begin{table}[htbp]", "  \\centering",
+              "  \\caption{Median shift of the canonical frame under input "
+              "degradation, in degrees, modulo symmetry.}",
+              "  \\label{tab:canon-robustness}",
+              "  \\begin{tabular}{l" + "r" * len(kinds) + "}", "    \\toprule",
+              "    Class & " + " & ".join(k.replace("%", "\\%") for k in kinds) + " \\\\",
+              "    \\midrule"]
+        for cls, r in rob.items():
+            L.append(f"    {cls.capitalize()} & " + " & ".join(
+                f"{r[k]['median_deg']:.2f}" if k in r else "--" for k in kinds) + " \\\\")
+        L += ["    \\bottomrule", "  \\end{tabular}", "\\end{table}", ""]
+
+    if gt:
+        L += ["\\begin{table}[htbp]", "  \\centering",
+              "  \\caption{Error against the known canonical pose of the "
+              "procedural shapes, in degrees, modulo symmetry.}",
+              "  \\label{tab:canon-pose-error}",
+              "  \\begin{tabular}{lrrr}", "    \\toprule",
+              "    Class & Mean & Median & Within $10^\\circ$ \\\\", "    \\midrule"]
+        for cls, g in gt.items():
+            L.append(f"    {cls.capitalize()} & {g['mean_deg']:.2f} & "
+                     f"{g['median_deg']:.2f} & {100 * g['frac_within_10deg']:.0f}\\% \\\\")
+        L += ["    \\bottomrule", "  \\end{tabular}", "\\end{table}", ""]
+
+    Path(path).write_text("\n".join(L), encoding="utf-8")
+    print(f"latex tables written to {Path(path).resolve()}")
+
+
+def write_report(path, results, baseline, gt, cls_report, meta, rob=None,
+                 kinds=PERTURBATIONS):
+    lines = ["Geometric canonicalisation: stability and consistency", "=" * 78, ""]
+    lines.append("settings: " + json.dumps(meta))
+    lines.append("")
+    lines.append("All figures are degrees; lower is better.")
+    lines.append("stability   : RMS spread of R_k A_k over random input rotations A_k")
+    lines.append("consistency : RMS spread of the canonical frames across instances")
+    lines.append("'sym' columns quotient out the object's rotational symmetry group.")
+    lines.append("")
+    for name, res in (("CLASS-CONDITIONAL GEOMETRIC RULES", results),
+                      ("PCA BASELINE", baseline)):
+        if not res:
+            continue
+        lines.append(name)
+        lines.append("-" * 78)
+        lines.append(f"{'class':10s} {'n':>4s} {'stab sym':>10s} {'stab med':>10s} "
+                     f"{'cons sym':>10s} {'cons med':>10s} {'<10deg':>8s} {'group':>8s}")
+        for cls, r in res.items():
+            grp = max(set(r["symmetry_groups"]), key=r["symmetry_groups"].count)
+            lines.append(f"{cls:10s} {r['n_instances']:4d} {r['stability_sym_deg']:10.3f} "
+                         f"{r['stability_sym_median_deg']:10.3f} "
+                         f"{r['consistency_sym_deg']:10.3f} "
+                         f"{r['consistency_sym_median_deg']:10.3f} "
+                         f"{100 * r.get('consistency_within10', 0.0):7.0f}% {grp:>8s}")
+        lines.append("")
+    if gt:
+        lines.append("ERROR AGAINST THE KNOWN POSE (procedural shapes only)")
+        lines.append("-" * 78)
+        for cls, g in gt.items():
+            lines.append(f"{cls:10s} mean {g['mean_deg']:8.3f}  median {g['median_deg']:8.3f}"
+                         f"  within 10 deg: {100 * g['frac_within_10deg']:5.1f}%")
+        lines.append("")
+    if rob:
+        lines.append("ROBUSTNESS: frame shift under input degradation "
+                     "(modulo symmetry)")
+        lines.append("-" * 78)
+        lines.append(f"{'class':10s}" + "".join(f"{k + ' (med/<10)':>19s}" for k in kinds))
+        for cls, r in rob.items():
+            lines.append(f"{cls:10s}" + "".join(
+                f"{r[k]['median_deg']:>11.2f} /{100 * r[k]['frac_within_10deg']:4.0f}%"
+                if k in r else f"{'-':>19s}" for k in kinds))
+        lines.append("")
+    if cls_report:
+        lines.append("LABEL STEP (nearest prototype on rotation-invariant features)")
+        lines.append("-" * 78)
+        lines.append(cls_report)
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\nreport written to {Path(path).resolve()}")
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+def main():
+    global PARTIAL_MIRROR, PCA_FIRST, REFERENCE_CLASSES, REFINE_CLASSES
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", default="processed_data", help="root with one folder per class")
+    ap.add_argument("--synthetic", action="store_true", help="force procedural shapes")
+    ap.add_argument("--instances", type=int, default=25)
+    ap.add_argument("--points", type=int, default=1024)
+    ap.add_argument("--mesh-points", type=int, default=MESH_POINTS,
+                    help="points taken off each .obj/.ply geometry (stored "
+                         "clouds keep --points)")
+    ap.add_argument("--rotations", type=int, default=8, help="random rotations per instance")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--no-reference", action="store_true",
+                    help="rules only, without the per-class reference attitude")
+    ap.add_argument("--ref-instances", type=int, default=10,
+                    help="instances used to build each class reference")
+    ap.add_argument("--save-reference", default=None,
+                    help="write the built references to this .npz for reuse")
+    ap.add_argument("--load-reference", default=None,
+                    help="reuse references from a .npz instead of building them")
+    ap.add_argument("--clusters", type=int, default=0,
+                    help="shape clusters per class reference; 0 uses the "
+                         "per-class defaults in CLUSTERS_PER_CLASS")
+    ap.add_argument("--no-pca-first", action="store_true",
+                    help="skip the principal-axis pre-canonicalisation; the "
+                         "rules then see the raw input pose and stability "
+                         "measures the rules themselves")
+    ap.add_argument("--reference-classes", default=",".join(REFERENCE_CLASSES),
+                    help="comma-separated classes that get a reference attitude "
+                         "('none' to disable)")
+    ap.add_argument("--no-refine", action="store_true",
+                    help="snap axes to the reference but skip the small ICP tweak")
+    ap.add_argument("--baseline", action="store_true", help="also run the PCA baseline")
+    ap.add_argument("--classifier", action="store_true", help="also run the label step")
+    ap.add_argument("--robustness", action="store_true",
+                    help="also measure noise, decimation and cropping")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="also run the dataset alignment check")
+    ap.add_argument("--partial-mirror", action="store_true",
+                    help="allow the mirror plane to leave the centroid "
+                         "(for heavily occluded or single-view scans)")
+    ap.add_argument("--latex", action="store_true",
+                    help="also write booktabs tables for the report")
+    ap.add_argument("--out", default=".", help="where to write report, json and figures")
+    args = ap.parse_args()
+
+    PARTIAL_MIRROR = args.partial_mirror
+    PCA_FIRST = not args.no_pca_first
+    if PCA_FIRST:
+        print("PCA pre-canonicalisation on: the pipeline is pose-invariant by "
+              "construction, so stability\nmeasures only the conditioning of the "
+              "principal axes, not the rules.  Read consistency,\nwhich is itself "
+              "measured on randomly rotated inputs, and --robustness.")
+
+    t_start = time.time()
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset, synthetic = {}, args.synthetic
+    if not args.synthetic:
+        root = Path(args.data)
+        if root.is_dir():
+            print(f"loading point clouds from {root.resolve()}")
+            dataset = load_real(root, args.instances, args.points, args.seed,
+                                args.mesh_points)
+        if not dataset:
+            print(f"no usable data under {Path(args.data).resolve()}; "
+                  f"falling back to procedural shapes")
+            synthetic = True
+    if synthetic:
+        print("generating procedural shapes (canonical pose known, so the pose "
+              "error below is a true accuracy figure)")
+        dataset = load_synthetic(args.instances, args.points, args.seed)
+
+    for cls, (clouds, _) in dataset.items():
+        print(f"  {cls:9s} {len(clouds):3d} clouds, {clouds[0].shape[0]} points each")
+
+    chosen = [c.strip() for c in args.reference_classes.split(",") if c.strip()]
+    if chosen and chosen != ["none"]:
+        REFERENCE_CLASSES = tuple(chosen)
+        REFINE_CLASSES = tuple(chosen)
+    else:
+        REFERENCE_CLASSES = REFINE_CLASSES = ()
+
+    references = {}
+    if args.load_reference:
+        references, rmeta = load_references(args.load_reference)
+        PCA_FIRST = bool(rmeta.get("pca_first", PCA_FIRST))
+        print(f"\nloaded references from {Path(args.load_reference).resolve()} "
+              f"({', '.join(references)}; pca_first={PCA_FIRST})")
+    elif not args.no_reference:
+        print(f"\nbuilding class references for "
+              f"{', '.join(REFERENCE_CLASSES)} from {args.ref_instances} instances each")
+        for cls, (clouds, _) in dataset.items():
+            if cls not in REFERENCE_CLASSES:
+                continue
+            references[cls] = build_reference(
+                clouds, cls, canonicalise, max_ref=args.ref_instances,
+                seed=args.seed,
+                n_clusters=args.clusters if args.clusters > 0 else None)
+    if args.save_reference and references:
+        save_references(args.save_reference, references,
+                        {"built_from": args.ref_instances})
+        print(f"references written to {Path(args.save_reference).resolve()}")
+
+    canon = make_canonicaliser(references, refine=not args.no_refine,
+                               refine_classes=REFINE_CLASSES)
+
+    diag = {}
+    if args.diagnose:
+        diag = diagnose_alignment(dataset, canon, args.seed)
+        print_diagnosis(diag)
+
+    print(f"\nevaluating ({args.rotations} random rotations per instance)")
+    results, feats, labels = evaluate(dataset, canon, args.rotations, args.seed,
+                                      want_features=args.classifier)
+    print_table(results, "STABILITY AND CONSISTENCY (degrees)")
+
+    baseline = {}
+    if args.baseline:
+        print("\nevaluating PCA baseline")
+        baseline, _, _ = evaluate(dataset, pca_baseline, args.rotations, args.seed,
+                                  want_features=False, baseline=True)
+        print_table(baseline, "PCA BASELINE (for comparison)")
+
+    gt = {}
+    if synthetic:
+        gt = ground_truth_error(dataset, canon)
+        print("\nERROR AGAINST THE KNOWN POSE (procedural shapes)")
+        print("-" * 60)
+        for cls, g in gt.items():
+            print(f"{cls:10s} mean {g['mean_deg']:8.3f} deg   median {g['median_deg']:8.3f} deg"
+                  f"   within 10 deg: {100 * g['frac_within_10deg']:5.1f}%")
+
+    rob = {}
+    if args.robustness:
+        print("\nevaluating robustness to noise, decimation and cropping")
+        rob = robustness(dataset, canon, args.seed)
+        print_robustness(rob)
+
+    cls_report = ""
+    if feats is not None and args.classifier and len(set(labels)) > 1:
+        pred = classify_leave_one_out(feats, labels)
+        labels_arr = np.array(labels)
+        acc = float((pred == labels_arr).mean())
+        rows = [f"overall accuracy {100 * acc:.1f}%  "
+                f"({len(labels_arr)} instances, leave-one-out)"]
+        for c in CLASS_ORDER:
+            m = labels_arr == c
+            if m.any():
+                rows.append(f"  {c:10s} {100 * float((pred[m] == c).mean()):5.1f}%")
+        cls_report = "\n".join(rows)
+        print("\nLABEL STEP (rotation-invariant features, nearest prototype)")
+        print("-" * 60)
+        print(cls_report)
+
+    if not args.no_figures:
+        print("\nfigures")
+        make_figures(dataset, canon, out_dir / "figures", args.seed)
+
+    meta = {"source": "synthetic" if synthetic else str(Path(args.data).resolve()),
+            "instances": args.instances, "points": args.points,
+            "rotations": args.rotations, "seed": args.seed}
+    write_report(out_dir / "canonicalisation_report.txt", results, baseline, gt,
+                 cls_report, meta, rob)
+    (out_dir / "canonicalisation_results.json").write_text(
+        json.dumps({"meta": meta, "rules": results, "baseline": baseline,
+                    "pose_error": gt, "robustness": rob,
+                    "alignment_check": diag}, indent=2), encoding="utf-8")
+    if args.latex:
+        write_latex(out_dir / "canonicalisation_tables.tex", results, baseline,
+                    gt, rob, meta)
+    print(f"json written to {(out_dir / 'canonicalisation_results.json').resolve()}")
+    print(f"total time {time.time() - t_start:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+# core pipeline
+numpy>=1.24
+scipy>=1.10
+trimesh>=4.0          # reads .obj and .ply, samples meshes
+torch>=2.0            # reads .pt clouds; CPU build is enough
+matplotlib>=3.7       # figures from geo_canon.py / class_report.py
+
+# only needed for --classify (Uni3D naming the class)
+huggingface_hub>=0.20
+easydict>=1.10
+timm>=0.9
