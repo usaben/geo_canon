@@ -52,6 +52,21 @@ processed_data/
 door, flower_pot, guitar, keyboard, lamp, laptop, monitor, piano, sofa, table,
 toilet, wardrobe.
 
+**What this repo carries: 50 clouds per class** (614 files, 8.8 MB) — enough for
+the demo and for `class_report.py`, which defaults to fewer than that. The full
+set is larger and lives outside git; `manifest.csv` lists every file of it, not
+just the ones here, so it doubles as the index of what you are missing.
+
+The ModelNet-derived files are dicts of `{points, variant}`. They originally also
+carried `knn_idx`, a 16-nearest-neighbour index that is 128 KB of each 140 KB
+file and that nothing in this pipeline reads; it was dropped here to keep the
+clone small. It is exactly recoverable from the points if you ever need it:
+
+```python
+from scipy.spatial import cKDTree
+knn_idx = cKDTree(points).query(points, k=17)[1][:, 1:]   # self excluded
+```
+
 The loaders also read `.npy`, `.npz`, and — sampled on the fly — `.obj` and
 `.ply` meshes, so you can point `--data` at a raw ShapeNet tree. A mesh is
 sampled at `--mesh-points` (default 8192); a `.ply` holding bare vertices, such
