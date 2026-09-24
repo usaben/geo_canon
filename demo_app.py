@@ -15,8 +15,9 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 import geo_canon as g
+import scene_canon
 
-STATE = {"data": {}, "canon": None, "refs": {}, "lock": threading.Lock()}
+STATE = {"data": {}, "canon": None, "refs": {}, "scene_index": {}, "lock": threading.Lock()}
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +246,11 @@ def prepare(args):
 
     build_class_signatures()
 
+    try:
+        STATE["scene_index"] = scene_canon.build_scene_index(Path(args.data))
+    except Exception as exc:
+        print(f"  [warn] failed to build scene index: {exc}")
+
 
 # ---------------------------------------------------------------------------
 # http
@@ -271,6 +277,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/api/index":
             return self._send({c: ids for c, (_, ids) in STATE["data"].items()})
+
+        if url.path == "/api/scene_index":
+            return self._send(STATE.get("scene_index", {}))
+
+        if url.path == "/api/scene":
+            cls = q.get("cls", [""])[0]
+            idx = int(q.get("idx", ["0"])[0])
+            s_idx = STATE.get("scene_index", {})
+            if cls not in s_idx or not s_idx[cls]:
+                return self._send({"error": "unknown scene class"}, 404)
+            idx = max(0, min(idx, len(s_idx[cls]) - 1))
+            scene_info = s_idx[cls][idx]
+            try:
+                xyz, rgb = scene_canon.load_scene_cloud(Path(scene_info["path"]))
+                sub_idx = scene_canon.subsample_scene(xyz, scene_canon.DEMO_SUBSAMPLE)
+                xyz = xyz[sub_idx]
+                xyz = g.normalise_cloud(xyz)[0]
+                return self._send({"points": np.round(xyz, 4).ravel().tolist(), "n": len(xyz), "id": scene_info["id"]})
+            except Exception as exc:
+                return self._send({"error": str(exc)}, 500)
 
         if url.path == "/api/cloud":
             cls = q.get("cls", [""])[0]
@@ -379,6 +405,49 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/upload":
             return self._upload()
+        
+        if path == "/api/canon_scene":
+            n = int(self.headers.get("Content-Length", 0))
+            req = json.loads(self.rfile.read(n) or b"{}")
+            items = req.get("items") or []
+            out, t0 = [], time.time()
+            s_idx = STATE.get("scene_index", {})
+            
+            for it in items:
+                cls = it.get("cls")
+                idx = int(it.get("idx", 0))
+                if cls not in s_idx or not s_idx[cls] or idx >= len(s_idx[cls]):
+                    out.append({"error": "scene not found"})
+                    continue
+                try:
+                    xyz, rgb = scene_canon.load_scene_cloud(Path(s_idx[cls][idx]["path"]))
+                    sub_idx = scene_canon.subsample_scene(xyz, scene_canon.DEMO_SUBSAMPLE)
+                    xyz_sub = xyz[sub_idx]
+                    xyz_sub = g.normalise_cloud(xyz_sub)[0]
+                    A = np.array(it.get("R") or [1, 0, 0, 0, 1, 0, 0, 0, 1], float).reshape(3, 3)
+                    U, _, Vt = np.linalg.svd(A)
+                    A = U @ np.diag([1.0, 1.0, float(np.sign(np.linalg.det(U @ Vt)))]) @ Vt
+                    rotated_cloud = xyz_sub @ A.T
+                    
+                    R, info = scene_canon.canonicalise_scene(rotated_cloud)
+                    
+                    out.append({
+                        "M": np.round(R @ A, 6).ravel().tolist(),
+                        "symmetry": info.get("symmetry", "I"),
+                        "cluster": None,
+                        "predicted_cls": cls,
+                        "predicted_conf": None,
+                        "predicted_by": "given",
+                        "snapped": False,
+                        "refined_deg": 0.0,
+                    })
+                except Exception as exc:
+                    out.append({"error": f"{type(exc).__name__}: {exc}"})
+                    
+            ms = 1000.0 * (time.time() - t0)
+            return self._send({"items": out, "ms": round(ms, 1),
+                               "per": round(ms / max(len(out), 1), 1)})
+
         if path != "/api/canon":
             return self._send({"error": "not found"}, 404)
         n = int(self.headers.get("Content-Length", 0))
@@ -560,6 +629,7 @@ PAGE = r"""<!doctype html>
   <div class="brand"><h1>geometric canonicalisation</h1>
     <p>turn the input any way you like &mdash; the canonical frame stays put</p></div>
   <div class="ctl">
+    <div class="field"><span>mode</span><select id="mode"><option value="object">Object</option><option value="scene">Scene</option></select></div>
     <div class="field"><span>class</span><select id="cls"></select></div>
     <div class="field"><span>show</span><select id="count"></select></div>
     <button id="pick">new objects</button>
@@ -605,7 +675,7 @@ PAGE = r"""<!doctype html>
   sky.style.backgroundSize='600px 600px,900px 900px';
 })();
 
-const S={cls:"all",n:4,items:[],busy:false,pending:false};
+const S={cls:"all",n:4,items:[],busy:false,pending:false,mode:"object"};
 const TIP=new THREE.Matrix4().makeRotationX(-Math.PI/2);
 
 // Chosen so cells stay near square in a panel roughly 1.5x wider than tall:
@@ -784,9 +854,11 @@ function randRot(){
 }
 
 let INDEX={};
+let SCENE_INDEX={};
 async function loadObjects(){
   S.items=[];
-  const classes=Object.keys(INDEX);
+  const index = S.mode === "scene" ? SCENE_INDEX : INDEX;
+  const classes=Object.keys(index);
   if(!classes.length) return;
 
   const targetClasses=[];
@@ -800,14 +872,15 @@ async function loadObjects(){
   classes.forEach(c=>usedPerClass[c]=new Set());
 
   for(const c of targetClasses){
-    const ids=INDEX[c]||[];
+    const ids=index[c]||[];
     if(!ids.length) continue;
     let idx=Math.floor(Math.random()*ids.length);
     if(usedPerClass[c].size<ids.length){
       while(usedPerClass[c].has(idx)) idx=Math.floor(Math.random()*ids.length);
       usedPerClass[c].add(idx);
     }
-    const d=await (await fetch(`/api/cloud?cls=${c}&idx=${idx}`)).json();
+    const endpoint = S.mode === "scene" ? "/api/scene" : "/api/cloud";
+    const d=await (await fetch(`${endpoint}?cls=${c}&idx=${idx}`)).json();
     const a=scene(d.points,false), b=scene(d.points,true);
     const it={cls:c,idx,id:d.id,W:randRot(),sA:a.sc,gA:a.grp,sB:b.sc,gB:b.grp,M:null,tag:""};
     setRot(it.gA,it.W); setRot(it.gB,new THREE.Matrix4());
@@ -841,7 +914,8 @@ async function go(){
         };
       })
     };
-    const d=await (await fetch("/api/canon",{method:"POST",
+    const endpoint = S.mode === "scene" ? "/api/canon_scene" : "/api/canon";
+    const d=await (await fetch(endpoint,{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json();
     if(d.error){document.getElementById("barB").textContent=d.error;}
     else{
@@ -942,22 +1016,39 @@ document.getElementById("reset").onclick=()=>{ S.items.forEach(it=>{
 
 (async function(){
   INDEX=await (await fetch("/api/index")).json();
+  SCENE_INDEX=await (await fetch("/api/scene_index")).json();
   const cs=document.getElementById("cls");
 
-  const autoOpt=document.createElement("option");
-  autoOpt.value="auto";
-  autoOpt.textContent="auto (predict)";
-  cs.appendChild(autoOpt);
+  function updateClsDropdown() {
+    cs.innerHTML = "";
+    if (S.mode === "object") {
+      const autoOpt=document.createElement("option");
+      autoOpt.value="auto"; autoOpt.textContent="auto (predict)"; cs.appendChild(autoOpt);
+      const mixedOpt=document.createElement("option");
+      mixedOpt.value="all"; mixedOpt.textContent="all (mixed)"; cs.appendChild(mixedOpt);
+      Object.keys(INDEX).forEach(c=>{
+        const o=document.createElement("option"); o.value=c; o.textContent=c; cs.appendChild(o);
+      });
+      S.cls = "auto";
+    } else {
+      const mixedOpt=document.createElement("option");
+      mixedOpt.value="all"; mixedOpt.textContent="all (mixed)"; cs.appendChild(mixedOpt);
+      Object.keys(SCENE_INDEX).forEach(c=>{
+        const o=document.createElement("option"); o.value=c; o.textContent=c; cs.appendChild(o);
+      });
+      S.cls = "all";
+    }
+    cs.value = S.cls;
+  }
 
-  const mixedOpt=document.createElement("option");
-  mixedOpt.value="all";
-  mixedOpt.textContent="all (mixed)";
-  cs.appendChild(mixedOpt);
-
-  Object.keys(INDEX).forEach(c=>{
-    const o=document.createElement("option");
-    o.value=c;o.textContent=c;cs.appendChild(o);
-  });
+  const modeSel = document.getElementById("mode");
+  modeSel.onchange = () => {
+    S.mode = modeSel.value;
+    updateClsDropdown();
+    loadObjects();
+  };
+  
+  updateClsDropdown();
 
   const cnt=document.getElementById("count");
   for(let i=1;i<=MAXN;i++){
