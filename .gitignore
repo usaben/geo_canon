@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 
 # datasets and archives: share these out of band, not in the repo
-processed_data/
+# processed_data/
 shapenet_subset/
 figures/
 photos/
