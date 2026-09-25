@@ -167,7 +167,7 @@ git clone https://github.com/usaben/geo_canon.git && cd geo_canon
 git checkout local_llm_integration
 conda create -n geocanon python=3.10 -y && conda activate geocanon
 pip install -r requirements.txt
-# processed_data/ is not in git: copy it next to geo_canon.py
+# processed_data/ (614 clouds) comes with the clone
 
 # 1. baseline (plain rules)
 python class_report.py --instances 100 --rotations 6 --refs none --no-figures \
@@ -283,22 +283,38 @@ all predate the current rules, including the up-sign fixes to car and chair.
 
 ## Quick: just produce the report files
 
-Run from `geo_canon/` with `processed_data/` in place. Each command writes one
-report.
+Clone, create the environment, run. The data (`processed_data/`) and the Uni3D
+files come with the clone; the part model's weights (89 MB) download on the
+first run, so it needs internet once.
 
 ```bash
-conda activate geocanon            # env built from requirements.txt
+# 1. get the code
+git clone https://github.com/usaben/geo_canon.git
+cd geo_canon
+git checkout local_llm_integration
 
+# 2. create the environment (once)
+conda create -n geocanon python=3.10 -y
+conda activate geocanon
+pip install -r requirements.txt
+
+# 3. reports -- same format as results_newb.txt
 # plain rules (the newb baseline)
 python class_report.py --instances 100 --rotations 6 --refs none --no-figures \
     --out report_newb.txt --simple-out report_newb_simple.txt
 
-# rules + part check (downloads the PatchAlign3D weights on first run)
+# new model: rules + part check
 python class_report.py --rules rules_parts.json --instances 100 --rotations 6 --refs none \
     --no-figures --out report_parts.txt --simple-out report_parts_simple.txt
 
-# rules + part check + vision-model check (needs rules_vlm.json from step 5 above
-# and the vLLM server from step 3 running)
+# compare
+diff report_newb.txt report_parts.txt
+```
+
+Optional, with the vision model (needs a GPU). Run steps 3–5 of "Step by step"
+above first; they start the vLLM server and create `rules_vlm.json`. Then:
+
+```bash
 export GEOCANON_VLM_URL=http://localhost:8000/v1
 export GEOCANON_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
 python class_report.py --rules rules_vlm.json --instances 100 --rotations 6 --refs none \
