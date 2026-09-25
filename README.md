@@ -278,3 +278,29 @@ Three things worth knowing before you write anything up:
 **Stale — regenerate before citing:** `refs.npz`, `class_report.txt`,
 `class_rules.txt`, `stability_consistency.txt`, `pipeline.txt` and `figures/`
 all predate the current rules, including the up-sign fixes to car and chair.
+
+---
+
+## Quick: just produce the report files
+
+Run from `geo_canon/` with `processed_data/` in place. Each command writes one
+report.
+
+```bash
+conda activate geocanon            # env built from requirements.txt
+
+# plain rules (the newb baseline)
+python class_report.py --instances 100 --rotations 6 --refs none --no-figures \
+    --out report_newb.txt --simple-out report_newb_simple.txt
+
+# rules + part check (downloads the PatchAlign3D weights on first run)
+python class_report.py --rules rules_parts.json --instances 100 --rotations 6 --refs none \
+    --no-figures --out report_parts.txt --simple-out report_parts_simple.txt
+
+# rules + part check + vision-model check (needs rules_vlm.json from step 5 above
+# and the vLLM server from step 3 running)
+export GEOCANON_VLM_URL=http://localhost:8000/v1
+export GEOCANON_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+python class_report.py --rules rules_vlm.json --instances 100 --rotations 6 --refs none \
+    --no-figures --out report_vlm.txt --simple-out report_vlm_simple.txt
+```
