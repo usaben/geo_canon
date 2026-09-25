@@ -34,6 +34,8 @@ UNI3D_ROOT = Path(os.environ.get(
     LOCAL_UNI3D_ROOT if (LOCAL_UNI3D_ROOT / "models" / "uni3d.py").is_file()
     else Path.home() / "Uni3D",
 )).expanduser()
+# the uni3d-s checkpoint, committed alongside so nobody has to hit the hub
+LOCAL_CKPT = Path(__file__).resolve().parent / "vendor" / "uni3d-s" / "model.pt"
 CKPT_REPO, CKPT_FILE = "BAAI/Uni3D", "modelzoo/uni3d-s/model.pt"
 
 # scripts/inference.sh, the `small` branch plus the flags shared by every scale.
@@ -143,6 +145,8 @@ def _install_easydict():
 def _checkpoint_path(ckpt=None):
     if ckpt:
         return str(ckpt)
+    if LOCAL_CKPT.is_file():
+        return str(LOCAL_CKPT)
     from huggingface_hub import hf_hub_download
     return hf_hub_download(CKPT_REPO, CKPT_FILE)
 
