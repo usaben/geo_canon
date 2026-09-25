@@ -138,6 +138,81 @@ python obj_to_pt.py
 
 ---
 
+## Part check and vision-model check (branch `local_llm_integration`)
+
+Two optional rule steps on top of the rules, switched on only through a rules
+file, so the default pipeline and every score are unchanged:
+
+- `part_check` (`part_cues.py`) labels object parts with PatchAlign3D.
+  - Model: CVPR 2026, MIT licence, CPU only. Its 89 MB of weights download on
+    first use.
+  - It then re-orients by part layout: tail behind wings, legs below the top.
+  - `rules_parts.json` switches it on for airplane and table.
+- `vlm_check` (`vlm_cues.py`) asks a vision-language model, served by vLLM or
+  Ollama, whether each of the six ways up looks upright. It reads the model's
+  yes-probability.
+  - It switches only past a margin, and only for classes that a pilot on both
+    data halves approved.
+  - If the server is down it falls back to the rules.
+
+Both steps only choose among the 24 axis-aligned turns of the rule's frame, and
+they keep the symmetry group, so they can't make the metric more lenient.
+Details: [VLM_CHECK.md](VLM_CHECK.md).
+
+### Step by step
+
+```bash
+# 0. code and environment
+git clone https://github.com/usaben/geo_canon.git && cd geo_canon
+git checkout local_llm_integration
+conda create -n geocanon python=3.10 -y && conda activate geocanon
+pip install -r requirements.txt
+# processed_data/ is not in git: copy it next to geo_canon.py
+
+# 1. baseline (plain rules)
+python class_report.py --instances 100 --rotations 6 --refs none --no-figures \
+    --out results_newb.txt --simple-out newb_simple.txt
+
+# 2. rules + part check (first run downloads the PatchAlign3D weights)
+python class_report.py --rules rules_parts.json --instances 100 --rotations 6 --refs none \
+    --no-figures --out results_parts.txt --simple-out parts_simple.txt
+
+# 3. vision-model server in its own env (vLLM pins its own torch).
+#    Full-precision 8B needs about 17 GB of VRAM.
+conda create -n vllm python=3.11 -y && conda activate vllm && pip install vllm
+vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000 --max-model-len 8192
+#    leave it running; in a second terminal:
+conda activate geocanon
+export GEOCANON_VLM_URL=http://localhost:8000/v1
+export GEOCANON_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+
+# 4. pilot: which classes does the model fix without breaking any?
+python vlm_pilot.py --rules rules_parts.json --half A --out pilot_A.json
+python vlm_pilot.py --rules rules_parts.json --half B --out pilot_B.json
+#    keep a class only if at the same margin it fixes more than it breaks on
+#    BOTH halves and breaks nothing on half A
+
+# 5. switch the check on for those classes (example: chair, monitor at margin 2)
+python rules_tool.py --base rules_parts.json --op vlm_check \
+    --classes chair,monitor --params '{"margin": 2.0}' --out rules_vlm.json
+
+# 6. final report (answers come from vlm_cache/, so this is quick)
+python class_report.py --rules rules_vlm.json --instances 100 --rotations 6 --refs none \
+    --no-figures --out results_vlm.txt --simple-out vlm_simple.txt
+diff results_newb.txt results_vlm.txt
+
+# 7. look at it in the browser: new pipeline on 8001, plain rules on 8000
+python demo_app.py --rules rules_vlm.json --port 8001 --clouds photos --classify
+python demo_app.py --port 8000 --clouds photos --classify
+```
+
+Use `rules_parts.json` in steps 6 and 7 if no class passes the pilot. Without
+a GPU, step 3 can use Ollama instead: `ollama pull qwen3-vl:8b-instruct`, then
+`GEOCANON_VLM_URL=http://127.0.0.1:11434/v1` and
+`GEOCANON_VLM_MODEL=qwen3-vl:8b-instruct`.
+
+---
+
 ## Historical measurements
 
 The figures below predate the current airplane, bed, bathtub, bench, and panel
@@ -193,6 +268,11 @@ Three things worth knowing before you write anything up:
 | `uni3d_probe.py` | builds `uni3d_centroids.npz` from labelled clouds |
 | `class_report.py` | per-class stability/consistency report and figures |
 | `obj_to_pt.py` | samples ShapeNet `.obj` meshes into `processed_data` |
+| `part_cues.py` | `part_check` step: PatchAlign3D part labels to part-layout re-orientation |
+| `vlm_cues.py` | `vlm_check` step: vision-model upright check through vLLM or Ollama |
+| `vlm_pilot.py` | per-class fixed/broken counts that decide where `vlm_check` may run |
+| `rules_tool.py` | adds `part_check` / `vlm_check` to chosen classes of a rules file |
+| `rules_parts.json` | `rules.json` + `part_check` for airplane and table |
 | `uni3d_centroids.npz` | 21 class centroids (1024-d), leave-one-out accuracy 75.4% |
 
 **Stale — regenerate before citing:** `refs.npz`, `class_report.txt`,

@@ -16,7 +16,7 @@ stays exactly as before. Without `--rules`, nothing changes.
 
 ```bash
 pip install vllm
-vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000 --max-model-len 8192   # 32 GB: try Qwen/Qwen3-VL-32B-Instruct-AWQ
+vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000 --max-model-len 8192   # full precision, ~17 GB of VRAM
 export GEOCANON_VLM_URL=http://localhost:8000/v1
 export GEOCANON_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
 ```
