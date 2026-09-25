@@ -2,7 +2,8 @@
 
 Class selection and cue recipes are now stored in [`rules.json`](rules.json).
 See [RULE_DATABASE.md](RULE_DATABASE.md) to add a class, compose operations, or
-load another database. The geometric decisions described below are preserved.
+load another database. Version 3 adds configurable [support cues](SUPPORT_RULES.md)
+on top of the frame constructors described below.
 
 The frame remains right-handed: **x forward, y left, z up**. Rules use geometry
 only. Stored dataset pose, file names, and evaluation up axes never enter a

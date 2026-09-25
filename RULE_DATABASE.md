@@ -82,6 +82,11 @@ Available modifiers:
 | `axial_symmetry` | `allow`: subset of `C2z`, `C4z`, `Cinfz`; `min_score` |
 | `panel_symmetry` | `min_score` (default 0.75); measure all three half-turns |
 | `end_closure` | `min_score` (default 0.65); refine a vessel axis and compare local end closure |
+| `panel_on_support` | Fit a panel, narrow stem and wider foot; configurable bands, score thresholds, and forward-sign policy |
+| `support_base` | `mode`: `legs`, `flat_base`, `either`; contact/balance scores, correction thresholds, optional principal/plane search |
+
+See [SUPPORT_RULES.md](SUPPORT_RULES.md) for the active support recipes,
+parameters, diagnostics, validation, and the equivalent Python API.
 
 Omitted parameters use the defaults on the registered geometric operation.
 `schema_version` is currently `1`. `fallback` names the recipe used for unknown
@@ -148,7 +153,8 @@ A class may specify a `reference` object with:
 Saved references and evaluation reports include a SHA-256 fingerprint of the
 validated database. Loading references with a missing or different fingerprint
 warns that they should be rebuilt. Older caches remain readable. The numerical
-ruleset version remains 2 because this migration preserves the algorithms.
+ruleset version was 2 for the data-only migration. The active support recipes
+use version 3; rebuild references when switching to these recipes.
 `build_reference`, `save_references`, and `load_references` accept an optional
 `rule_database` for isolated experiments; pass the same database and a bound
 canonicaliser throughout.

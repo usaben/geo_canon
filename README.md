@@ -56,6 +56,10 @@ function is needed. All three CLIs accept `--rules path/to/rules.json`.
 See [the database guide](RULE_DATABASE.md) for examples, validation, reference
 policies, and migration checks.
 
+[Support cues](SUPPORT_RULES.md) cover panel stands, spaced legs, and filled
+flat bases. The active recipes select these operations and their thresholds
+through JSON; weak or competing evidence keeps the preceding frame.
+
 ## Data
 
 ```

@@ -78,9 +78,27 @@ class Operation:
                 _check(0 <= value <= 100, f"{where}.{key}: must be in [0, 100]")
             if key.endswith(("_frac", "_score", "_threshold")):
                 _check(0 <= value <= 1, f"{where}.{key}: must be in [0, 1]")
+            if key in ("panel_frac", "slab_frac", "stem_width_ratio", "contact_frac", "lower_frac", "max_lower_mass"):
+                _check(type(value) in (int, float) and 0 < value < 1,
+                       f"{where}.{key}: must be in (0, 1)")
+            if key == "base_expansion":
+                _check(value > 1, f"{where}.{key}: must exceed 1")
+            if key == "min_points":
+                _check(value >= 3, f"{where}.{key}: must be at least 3")
+            if key in ("foot_bands", "shoulder_bands"):
+                _check(all(type(v) in (int, float) and 0 < v < 0.8 for v in value),
+                       f"{where}.{key}: expected fractions in (0, 0.8)")
+                _check(all(a < b for a, b in zip(value, value[1:])),
+                       f"{where}.{key}: must be strictly increasing")
         values = dict(defaults, **params)
         if "fwd_axis" in values and "up_axis" in values:
             _check(values["fwd_axis"] != values["up_axis"], f"{where}: forward and up axes must differ")
+        if "foot_bands" in values and "shoulder_bands" in values:
+            _check(min(values["foot_bands"]) + 0.03 < max(values["shoulder_bands"]),
+                   f"{where}: no shoulder band leaves room above a foot band")
+        if "contact_frac" in values and "lower_frac" in values:
+            _check(values["contact_frac"] < values["lower_frac"],
+                   f"{where}: contact_frac must be smaller than lower_frac")
         # Tuples prevent a caller mutating a compiled recipe through its source
         # document after validation.
         return partial(self.function, **{k: tuple(v) if isinstance(v, list) else v

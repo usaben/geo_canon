@@ -43,8 +43,10 @@ from scipy.spatial import cKDTree
 
 if __package__:
     from .rule_database import Operation, RuleDatabase
+    from .support_cues import surface_evidence
 else:  # direct script execution, as used by the demo and CLI
     from rule_database import Operation, RuleDatabase
+    from support_cues import surface_evidence
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -68,7 +70,7 @@ PARTIAL_MIRROR = False  # let the mirror plane leave the centroid.  Correct for
                         # map one wing of an aircraft onto the other -- so it is
                         # off by default and exposed as --partial-mirror
 EPS = 1e-12
-RULESET_VERSION = 2
+RULESET_VERSION = 3
 
 
 # ----------------------------------------------------------------------------
@@ -1457,6 +1459,239 @@ def upright_frame(shape, up_axis="plate", up_sign="support", crown_pct=72,
                                  "symmetry": sym, "flip_scores": sc}
 
 
+def panel_on_support(shape, R, info, panel_frac=0.18, slab_frac=0.08,
+                     stem_width_ratio=0.55, base_expansion=1.25,
+                     min_points=10, score_threshold=0.12,
+                     margin_threshold=0.08, face_threshold=0.20,
+                     forward_policy="preserve", crown_pct=88,
+                     foot_bands=(0.04, 0.08, 0.12),
+                     shoulder_bands=(0.10, 0.14, 0.20, 0.30, 0.40, 0.50)):
+    """Refine a frame when a broad panel sits above a narrow stem and foot.
+
+    A modifier so a recipe explicitly supplies the fallback frame. Search in
+    the panel's own plane, including both axes/signs for portrait displays.
+    A supported panel can be a monitor, sign or display; no class labels or
+    world-coordinate directions enter the detector. Weak/absent support keeps
+    the incoming frame. Front/back is measured independently from face density.
+    """
+    X = shape.X
+    panels = []
+    for normal in shape.V.T:
+        for _ in range(2):
+            fraction, centre, _ = slab_peak(X, normal, width=slab_frac, ends_only=False)
+            normal, _ = plane_normal_of_slab(X, normal, centre, width=slab_frac)
+        fraction, centre, _ = slab_peak(X, normal, width=slab_frac, ends_only=False)
+        depth = X @ normal
+        mask = np.abs(depth - centre) <= slab_frac * max(np.ptp(depth), EPS)
+        if fraction < panel_frac or mask.sum() < max(20, min_points):
+            continue
+        points = X[mask] - X[mask].mean(0)
+        w, _ = np.linalg.eigh(points.T @ points / len(points))
+        # Reject a line/edge masquerading as a plane, and non-planar volumes.
+        if w[1] <= EPS or w[0] / w[1] > 0.08:
+            continue
+        # Fit screen edges rather than using in-plane PCA: nearly square
+        # screens make those eigenvectors rotate toward arbitrary diagonals.
+        from scipy.spatial import ConvexHull, QhullError
+        a, b, _, _ = _plane_pca_axes(points, normal)
+        projection = np.column_stack([points @ a, points @ b])
+        try:
+            hull = projection[ConvexHull(projection).vertices]
+            best_area, direction = np.inf, None
+            for edge in np.roll(hull, -1, axis=0) - hull:
+                length = np.linalg.norm(edge)
+                if length <= EPS:
+                    continue
+                c, s = edge / length
+                aligned = hull @ np.array([[c, -s], [s, c]])
+                area = float(np.prod(np.ptp(aligned, axis=0)))
+                if area < best_area:
+                    best_area, direction = area, c * a + s * b
+            if direction is not None:
+                a = unit(direction)
+                b = unit(np.cross(normal, a))
+        except QhullError:
+            continue
+        panels.append((float(fraction * np.sqrt(w[1] * w[2])), normal, a, b))
+
+    candidates = []
+    for panel_strength, normal, a, b in sorted(panels, key=lambda p: -p[0])[:1]:
+        depth = X @ normal
+        for axis in (a, b):
+            for up in (axis, -axis):
+                lateral = unit(np.cross(normal, up))
+                h, side = X @ up, X @ lateral
+                low, high = np.quantile(h, [0.01, 0.99])
+                height = max(high - low, EPS)
+                t = (h - low) / height
+                best = None
+                for foot_end in foot_bands:
+                    foot = t <= 0.8 * foot_end
+                    if foot.sum() < min_points:
+                        continue
+                    foot_width = float(np.ptp(np.quantile(side[foot], [0.05, 0.95])))
+                    foot_depth = float(np.ptp(np.quantile(depth[foot], [0.05, 0.95])))
+                    for shoulder in shoulder_bands:
+                        if shoulder <= foot_end + 0.03:
+                            continue
+                        stem = (t >= foot_end) & (t < shoulder)
+                        screen = (t >= shoulder + 0.08) & (t <= 0.95)
+                        if min(stem.sum(), screen.sum()) < min_points:
+                            continue
+                        width = float(np.ptp(np.quantile(side[screen], [0.05, 0.95])))
+                        stem_width = float(np.ptp(np.quantile(side[stem], [0.05, 0.95])))
+                        stem_depth = float(np.ptp(np.quantile(depth[stem], [0.05, 0.95])))
+                        ratio = stem_width / max(width, EPS)
+                        expansion = max(foot_width / max(stem_width, EPS),
+                                        foot_depth / max(stem_depth, EPS))
+                        offset = abs(float(np.median(side[stem]) - np.median(side[screen]))) / max(width, EPS)
+                        # A foot must spread below a centered stem. Reject side
+                        # attachments and a rectangular panel without a neck.
+                        if ratio > stem_width_ratio or expansion < base_expansion or offset > 0.25:
+                            continue
+                        coverage = float(np.ptp(h[stem])) / max((shoulder - foot_end) * height, EPS)
+                        score = ((1.0 - ratio) * min(1.0, expansion - 1.0)
+                                 * min(1.0, coverage) * (1.0 - 2.0 * offset))
+                        if best is None or score > best[0]:
+                            best = (score, shoulder, ratio, expansion)
+                if best is not None:
+                    candidates.append((best[0], up, normal, best[1], best[2], best[3]))
+
+    metadata = dict(info, stand_detected=False, stand_score=0.0,
+                    stand_margin=0.0, stand_reason="no_panel_stem_base")
+    if not candidates:
+        return R, metadata
+    candidates.sort(key=lambda item: -item[0])
+    score, up, normal, shoulder, ratio, expansion = candidates[0]
+    runner_up = candidates[1][0] if len(candidates) > 1 else 0.0
+    margin = score - runner_up
+    metadata.update(stand_score=float(score), stand_margin=float(margin),
+                    stem_width_ratio=float(ratio), base_expansion=float(expansion))
+    if score < score_threshold or margin < margin_threshold:
+        metadata["stand_reason"] = "weak_or_competing_support"
+        return R, metadata
+
+    # Independently sign the panel normal: a flat screen concentrates points
+    # at one depth; a curved/recessed rear housing distributes them in depth.
+    h = X @ up
+    low, high = np.quantile(h, [0.01, 0.99])
+    screen = X[h >= low + (shoulder + 0.08) * (high - low)]
+    d = screen @ normal
+    lo, hi = np.quantile(d, [0.02, 0.98])
+    band = 0.08 * max(hi - lo, EPS)
+    low_mass = float(np.mean(d <= lo + band))
+    high_mass = float(np.mean(d >= hi - band))
+    vote = (high_mass - low_mass) / max(high_mass + low_mass, EPS)
+    if forward_policy == "density" and abs(vote) >= face_threshold:
+        forward = normal if vote >= 0 else -normal
+        face_cue = "panel_face_density"
+        face_confidence = abs(vote)
+    elif forward_policy == "crown" or abs(normal @ R[0]) < 0.9:
+        crown = X[h >= np.percentile(h, crown_pct)]
+        offset = float(np.mean(crown @ normal))
+        forward = normal if offset <= 0 else -normal
+        face_cue = "panel_crown_offset"
+        face_confidence = abs(offset) / max(float(np.ptp(X @ normal)), EPS)
+    else:
+        # The detector supplies a normal, not an invented front/back symmetry.
+        # Retain the incoming sign and expose the weak evidence.
+        forward = normal if normal @ R[0] >= 0 else -normal
+        face_cue = "previous_frame_sign"
+        face_confidence = info.get("forward_confidence", 0.0)
+    metadata.update(stand_detected=True, stand_reason="panel_stem_base",
+                    up_cue="panel_support", up_confidence=float(margin),
+                    forward_cue=face_cue, forward_confidence=float(face_confidence),
+                    symmetry="I")
+    return frame_from(forward, up), metadata
+
+
+def support_base(shape, R, info, mode="either", contact_frac=0.04,
+                 lower_frac=0.30, max_lower_mass=0.35, min_points=10,
+                 score_threshold=0.30, margin_threshold=0.20,
+                 forward_policy="preserve", crown_pct=72, axis_search="sign",
+                 symmetry_allow=("I",)):
+    """Resolve up/down from sparse supports or a filled, balanced contact base.
+
+    By default keep the axis selected by the preceding recipe. Optional PCA
+    and plane candidates can repair a wrong axis as well as its sign. Searches
+    can make a laptop balance on its screen, so a recipe must explicitly opt
+    in; require a strong absolute score and a margin over competing supports.
+    """
+    positive = surface_evidence(shape.X, R[2], contact_frac, lower_frac, max_lower_mass, min_points)
+    negative = surface_evidence(shape.X, -R[2], contact_frac, lower_frac, max_lower_mass, min_points)
+    def score(evidence):
+        return max(evidence['legs'], evidence['flat_base']) if mode == "either" else evidence[mode]
+    pos, neg = score(positive), score(negative)
+    candidates = [(pos, R[2], positive), (neg, -R[2], negative)]
+    if axis_search != "sign":
+        axes = list(shape.V.T)
+        if axis_search == "planes":
+            slabs = []
+            # Eigensolver vectors are unsigned. Complete all sign choices so
+            # a harmless PCA sign flip cannot change which planes are searched.
+            signs = np.array([[a, b, c] for a in (-1., 1.)
+                              for b in (-1., 1.) for c in (-1., 1.)])
+            grid = np.concatenate([fib_hemisphere(24) * sign @ shape.V.T for sign in signs])
+            for axis in np.vstack([shape.V.T, grid]):
+                fraction, centre, _ = slab_peak(shape.X, axis, width=.07, ends_only=False)
+                slabs.append((fraction, axis, centre))
+            fitted = []
+            for _, axis, centre in sorted(slabs, key=lambda p: -p[0]):
+                normal, flat = plane_normal_of_slab(shape.X, axis, centre, width=.07)
+                if flat > .95 and not any(abs(normal @ other) > .995 for other in fitted):
+                    axes.append(normal)
+                    fitted.append(normal)
+                    if len(fitted) >= 6:
+                        break
+        for axis in axes:
+            if any(abs(axis @ c[1]) > .9995 for c in candidates):
+                continue
+            for up in (axis, -axis):
+                evidence = surface_evidence(shape.X, up, contact_frac, lower_frac, max_lower_mass, min_points)
+                candidates.append((score(evidence), up, evidence))
+    effective_mode = mode
+    if mode == "either":
+        # An upside-down tabletop is also a filled contact surface. Prefer
+        # convincing sparse-support structure; use a filled base when that
+        # structure is absent, rather than letting a solid top overrule legs.
+        effective_mode = ("legs" if max(c[2]['legs'] for c in candidates) >= score_threshold
+                          else "flat_base")
+        candidates = [(c[2][effective_mode], c[1], c[2]) for c in candidates]
+    candidates.sort(key=lambda c: -c[0])
+    best, up, evidence = candidates[0]
+    # Nearby estimates of the same unsigned axis are refinements, not a
+    # competing support. Opposite signs still compete independently.
+    runner_up = max((c[0] for c in candidates[1:] if c[1] @ up < .98), default=0.0)
+    margin = best - runner_up
+    metadata = dict(info, support_mode=mode, support_effective_mode=effective_mode, support_applied=False,
+                    support_scores={"positive": positive, "negative": negative},
+                    support_margin=float(margin), support_axis_search=axis_search,
+                    support_best=evidence)
+    if best < score_threshold or margin < margin_threshold:
+        return R, dict(metadata, support_reason="weak_or_competing_support")
+    if up @ R[2] > .999:
+        return R, dict(metadata, support_reason="confirms_existing_up")
+    forward = R[0] - (R[0] @ up) * up
+    if np.linalg.norm(forward) < .1:
+        forward = _plane_pca_axes(shape.X, up)[0]
+    forward = unit(forward)
+    if forward_policy == "crown_vote":
+        forward, confidence = crown_direction(shape.X, up, forward)
+        metadata['forward_confidence'] = float(confidence)
+    elif forward_policy == "crown":
+        h = shape.X @ up
+        crown = shape.X[h >= np.percentile(h, crown_pct)]
+        if float(np.mean(crown @ forward)) > 0:
+            forward = -forward
+    metadata.update(support_applied=True, support_reason="stronger_support",
+                    up_cue="support_" + mode, up_confidence=float(margin))
+    if abs(up @ R[2]) < .98:
+        # A symmetry about the old up axis cannot survive an axis swap by fiat.
+        metadata['symmetry'], metadata['sym_scores'] = detect_axial_symmetry(
+            shape, up, allow=symmetry_allow, min_score=.65)
+    return frame_from(forward, up), metadata
+
+
 def revolution_frame(shape, wide_end_up=True, sign_forward=True,
                      narrow_tie_up=False, end_frac=0.22):
     """A surface of revolution: the axis carries everything, the azimuth is
@@ -2142,6 +2377,13 @@ OPERATIONS = {
                                 choices={"allow": ("C2z", "C4z", "Cinfz")}),
     "panel_symmetry": Operation(panel_symmetry, modifier=True),
     "end_closure": Operation(end_closure, modifier=True),
+    "panel_on_support": Operation(panel_on_support, modifier=True,
+                                   choices={"forward_policy": ("preserve", "crown", "density")}),
+    "support_base": Operation(support_base, modifier=True, choices={
+        "mode": ("legs", "flat_base", "either"),
+        "axis_search": ("sign", "principal", "planes"),
+        "symmetry_allow": ("I", "C2z", "C4z", "Cinfz"),
+        "forward_policy": ("preserve", "crown", "crown_vote")}),
 }
 DEFAULT_RULES_PATH = Path(__file__).with_name("rules.json")
 

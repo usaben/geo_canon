@@ -146,6 +146,44 @@
         }
       }
     ],
+    "monitor_stand": [
+      {
+        "op": "upright",
+        "params": {
+          "up_axis": "principal",
+          "up_sign": "wide_up",
+          "crown_pct": 88,
+          "flip_symmetry": false
+        }
+      },
+      {
+        "op": "panel_on_support",
+        "params": {
+          "panel_frac": 0.18,
+          "slab_frac": 0.08,
+          "stem_width_ratio": 0.55,
+          "base_expansion": 1.25,
+          "min_points": 10,
+          "score_threshold": 0.12,
+          "margin_threshold": 0.08,
+          "forward_policy": "crown",
+          "crown_pct": 88,
+          "foot_bands": [
+            0.04,
+            0.08,
+            0.12
+          ],
+          "shoulder_bands": [
+            0.1,
+            0.14,
+            0.2,
+            0.3,
+            0.4,
+            0.5
+          ]
+        }
+      }
+    ],
     "supported_case": [
       {
         "op": "supported_case"
@@ -178,6 +216,270 @@
     "generic": [
       {
         "op": "generic"
+      }
+    ],
+    "table_supported": [
+      {
+        "op": "platform"
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "legs",
+          "forward_policy": "preserve",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "bench_supported": [
+      {
+        "op": "upright",
+        "params": {
+          "up_axis": "sharpest"
+        }
+      },
+      {
+        "op": "crown_forward"
+      },
+      {
+        "op": "axial_symmetry",
+        "params": {
+          "allow": [
+            "C2z"
+          ],
+          "min_score": 0.65
+        }
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "legs",
+          "forward_policy": "crown_vote",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "planes",
+          "symmetry_allow": [
+            "C2z"
+          ]
+        }
+      }
+    ],
+    "chair_supported": [
+      {
+        "op": "bilateral",
+        "params": {
+          "plate_cue": "seat_plate",
+          "project_up": false,
+          "up_sign": "top_short"
+        }
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "legs",
+          "forward_policy": "crown",
+          "crown_pct": 50,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "sofa_supported": [
+      {
+        "op": "bilateral",
+        "params": {
+          "lateral": "principal",
+          "up_axis": "support",
+          "crown_pct": 72
+        }
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "legs",
+          "forward_policy": "crown",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "laptop_supported": [
+      {
+        "op": "bilateral"
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "flat_base",
+          "forward_policy": "crown",
+          "crown_pct": 50,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.45,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "bed_supported": [
+      {
+        "op": "bilateral",
+        "params": {
+          "up_sign": "upper_structure",
+          "forward": "crown_vote"
+        }
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "either",
+          "forward_policy": "crown_vote",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "bathtub_supported": [
+      {
+        "op": "open_basin"
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "either",
+          "forward_policy": "crown_vote",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.45,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "piano_supported": [
+      {
+        "op": "supported_case"
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "either",
+          "forward_policy": "preserve",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "wardrobe_supported": [
+      {
+        "op": "upright",
+        "params": {
+          "up_axis": "principal",
+          "up_sign": "base",
+          "flip_symmetry": true
+        }
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "flat_base",
+          "forward_policy": "preserve",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      }
+    ],
+    "flower_pot_supported": [
+      {
+        "op": "revolution"
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "flat_base",
+          "forward_policy": "preserve",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.45,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
       }
     ]
   },
@@ -212,7 +514,7 @@
     },
     {
       "name": "chair",
-      "recipe": "seat_back",
+      "recipe": "chair_supported",
       "symmetry": "I",
       "synset": "03001627",
       "reference": {
@@ -223,7 +525,7 @@
     },
     {
       "name": "table",
-      "recipe": "platform",
+      "recipe": "table_supported",
       "symmetry": "C2z",
       "synset": "04379243"
     },
@@ -235,13 +537,13 @@
     },
     {
       "name": "laptop",
-      "recipe": "hinged_panels",
+      "recipe": "laptop_supported",
       "symmetry": "I",
       "synset": "03642806"
     },
     {
       "name": "bed",
-      "recipe": "headboard",
+      "recipe": "bed_supported",
       "symmetry": "I",
       "synset": "02818832",
       "reference": {
@@ -263,13 +565,13 @@
     },
     {
       "name": "sofa",
-      "recipe": "wide_back",
+      "recipe": "sofa_supported",
       "symmetry": "I",
       "synset": "04256520"
     },
     {
       "name": "bathtub",
-      "recipe": "open_basin",
+      "recipe": "bathtub_supported",
       "symmetry": "I",
       "synset": "02808440",
       "reference": {
@@ -285,7 +587,7 @@
     },
     {
       "name": "bench",
-      "recipe": "seat_optional_back",
+      "recipe": "bench_supported",
       "symmetry": "I",
       "synset": "02828884"
     },
@@ -302,7 +604,7 @@
     },
     {
       "name": "flower_pot",
-      "recipe": "wide_top_axial",
+      "recipe": "flower_pot_supported",
       "symmetry": "Cinfz",
       "synset": "03991062",
       "aliases": [
@@ -323,13 +625,13 @@
     },
     {
       "name": "monitor",
-      "recipe": "wide_top_upright",
+      "recipe": "monitor_stand",
       "symmetry": "I",
       "synset": "03211117"
     },
     {
       "name": "piano",
-      "recipe": "supported_case",
+      "recipe": "piano_supported",
       "symmetry": "I",
       "synset": "03928116"
     },
@@ -340,7 +642,7 @@
     },
     {
       "name": "wardrobe",
-      "recipe": "closed_base_box",
+      "recipe": "wardrobe_supported",
       "symmetry": "I"
     },
     {
