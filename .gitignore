@@ -32,3 +32,4 @@ pipeline.txt
 
 # PatchAlign3D weights: fetched from Hugging Face on first use by part_cues.py
 vendor/patchalign3d_ckpt/
+vlm_cache/

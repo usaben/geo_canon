@@ -45,10 +45,12 @@ if __package__:
     from .rule_database import Operation, RuleDatabase
     from .support_cues import surface_evidence
     from .part_cues import part_check
+    from .vlm_cues import vlm_check
 else:  # direct script execution, as used by the demo and CLI
     from rule_database import Operation, RuleDatabase
     from support_cues import surface_evidence
     from part_cues import part_check
+    from vlm_cues import vlm_check
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -2570,6 +2572,7 @@ OPERATIONS = {
         "metric": ("mass", "area", "occupancy", "central", "planarity", "closure"),
         "front": ("sparse", "dense")}),
     "part_check": Operation(part_check, modifier=True),
+    "vlm_check": Operation(vlm_check, modifier=True),
 }
 DEFAULT_RULES_PATH = Path(__file__).with_name("rules.json")
 
