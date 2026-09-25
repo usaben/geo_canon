@@ -982,6 +982,8 @@ document.getElementById("reset").onclick=()=>{ S.items.forEach(it=>{
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data", default="processed_data")
+    ap.add_argument("--rules", type=Path, default=g.DEFAULT_RULES_PATH,
+                    help="JSON rule database")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--instances", type=int, default=12)
     ap.add_argument("--points", type=int, default=1024)
@@ -1005,6 +1007,7 @@ def main():
     ap.add_argument("--uni3d-ckpt", default=None,
                     help="uni3d-s model.pt; downloaded from the hub if omitted")
     args = ap.parse_args()
+    g.configure_rules(args.rules)
 
     prepare(args)
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

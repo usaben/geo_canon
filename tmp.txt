@@ -1,0 +1,101 @@
+stability and consistency by class [main branch]
+==============================================================================
+
+generated   2026-09-24 02:34
+data        E:\L4-T1\capstone\fin2\geo_canon\processed_data
+instances   up to 50 per class
+rotations   6 random poses per instance (stability)
+references  none
+pca_first   True
+
+stability   one cloud, many input poses -- does the frame follow the
+            object when the object turns?  ~0 is the pass mark.
+consistency many clouds of one class, each from a random pose -- do
+            different instances land in the same frame?  The hard one.
+sym         measured modulo the detected symmetry group.
+
+------------------------------------------------------------------------------
+class        n  stab sym  cons sym  cons med  <10deg   group      rule
+------------------------------------------------------------------------------
+airplane    50     1.486    85.671     6.428     64%       I  built-in
+car         50     2.433    78.368     3.029     70%       I  built-in
+chair       50     0.218   109.780     7.612     56%       I  built-in
+table       50     2.728    33.143     2.910     88%     C2z  built-in
+bowl        50     1.924    27.599     1.350     88%   Cinfz  built-in
+laptop      25     8.549    87.817    30.290      0%       I     added
+bed         20     0.085    94.952     6.489     70%       I     added
+bottle      20     0.000     0.316     0.229    100%   Cinfz     added
+guitar      20     0.000    98.076    74.964      0%       I     added
+sofa        20     0.000   117.323    61.414      5%       I     added
+bathtub     30     5.924    92.658    64.244      0%       I     added
+bench       20     0.030    97.182    80.216      0%     C2x     added
+bookshelf   30     0.106    97.554    84.697      0%     C2x     added
+door        20     0.000   101.580     9.874     55%     C2z     added
+flower_pot  20     5.892    52.938     8.729     60%   Cinfz     added
+keyboard    20     0.000    92.721    58.926     40%     C2z     added
+lamp        19     0.000    96.977     8.658     53%   Cinfz     added
+monitor     30     0.151   117.847   125.140      0%       I     added
+piano       30     7.035    92.497    94.746      0%       I     added
+toilet      20     3.572   109.861    64.075     20%       I     added
+wardrobe    20     0.000    97.432    86.368      0%     C2x     added
+------------------------------------------------------------------------------
+MEAN               1.911    84.871    41.923     37%
+
+Read the median as well as the RMS column: RMS squares the errors, so a
+single inverted instance in twenty shows up as roughly 40 degrees and
+hides the fact that the rest agree closely.
+
+CAVEAT -- consistency assumes aligned storage
+------------------------------------------------------------------------------
+Consistency compares frames in each object's OWN stored coordinates,
+which only means what it should if the dataset stores every instance
+in a common pose.  ShapeNet does.  ModelNet is upright-aligned but
+not azimuth-aligned, and these classes are affected:
+
+    laptop: stored azimuth varies between instances, so the
+            consistency figure below includes that spread and
+            overstates the rule's error.
+
+per-instance consistency, degrees from the consensus frame
+------------------------------------------------------------------------------
+airplane   median   6.43   worst 179.82   instances over 45 deg: 15/50
+           excluding those: median   5.47, max  19.85
+car        median   3.03   worst 179.71   instances over 45 deg: 12/50
+           excluding those: median   2.85, max  33.49
+chair      median   7.61   worst 179.99   instances over 45 deg: 20/50
+           excluding those: median   4.26, max  18.54
+table      median   2.91   worst 177.30   instances over 45 deg: 4/50
+           excluding those: median   2.87, max  28.00
+bowl       median   1.35   worst 179.34   instances over 45 deg: 2/50
+           excluding those: median   1.29, max  35.72
+laptop     median  30.29   worst 167.43   instances over 45 deg: 12/25
+           excluding those: median  25.79, max  30.29
+bed        median   6.49   worst 178.70   instances over 45 deg: 6/20
+           excluding those: median   4.71, max   9.63
+bottle     median   0.23   worst   0.54   instances over 45 deg: 0/20
+guitar     median  74.96   worst 170.46   instances over 45 deg: 12/20
+           excluding those: median  21.93, max  38.46
+sofa       median  61.41   worst 173.63   instances over 45 deg: 10/20
+           excluding those: median  13.71, max  27.82
+bathtub    median  64.24   worst 178.90   instances over 45 deg: 16/30
+           excluding those: median  22.71, max  30.16
+bench      median  80.22   worst 168.93   instances over 45 deg: 14/20
+           excluding those: median  11.73, max  12.68
+bookshelf  median  84.70   worst 166.13   instances over 45 deg: 23/30
+           excluding those: median  19.99, max  25.82
+door       median   9.87   worst 179.65   instances over 45 deg: 8/20
+           excluding those: median   9.63, max  17.03
+flower_pot median   8.73   worst 166.36   instances over 45 deg: 3/20
+           excluding those: median   8.50, max  29.37
+keyboard   median  58.93   worst 174.55   instances over 45 deg: 10/20
+           excluding those: median   6.45, max  34.08
+lamp       median   8.66   worst 173.48   instances over 45 deg: 7/19
+           excluding those: median   7.50, max  12.89
+monitor    median 125.14   worst 176.72   instances over 45 deg: 19/30
+           excluding those: median  31.21, max  43.32
+piano      median  94.75   worst 170.57   instances over 45 deg: 25/30
+           excluding those: median  42.12, max  44.26
+toilet     median  64.08   worst 179.42   instances over 45 deg: 10/20
+           excluding those: median  30.61, max  42.00
+wardrobe   median  86.37   worst 164.94   instances over 45 deg: 16/20
+           excluding those: median  33.31, max  33.94

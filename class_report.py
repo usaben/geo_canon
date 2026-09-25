@@ -69,6 +69,7 @@ def write_report(path, results, meta):
     L.append(f"rotations   {meta['rotations']} random poses per instance (stability)")
     L.append(f"references  {meta['refs']}")
     L.append(f"pca_first   {g.PCA_FIRST}")
+    L.append(f"rules       {g.RULE_DATABASE.fingerprint}")
     L.append("")
     L.append("stability   one cloud, many input poses -- does the frame follow the")
     L.append("            object when the object turns?  ~0 is the pass mark.")
@@ -137,6 +138,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="processed_data")
+    ap.add_argument("--rules", type=Path, default=g.DEFAULT_RULES_PATH,
+                    help="JSON rule database")
     ap.add_argument("--instances", type=int, default=16)
     ap.add_argument("--points", type=int, default=1024)
     ap.add_argument("--rotations", type=int, default=6)
@@ -148,9 +151,20 @@ def main():
     ap.add_argument("--figures", default="figures")
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args()
+    g.configure_rules(args.rules)
 
-    ds = g.load_real(Path(args.data), args.instances, args.points, args.seed)
+    data_path = Path(args.data)
+    if not data_path.exists() and not data_path.is_absolute():
+        script_relative = Path(__file__).resolve().parent / data_path
+        if script_relative.exists():
+            data_path = script_relative
+    if not data_path.is_dir():
+        ap.error(f"data directory not found: {data_path}")
+
+    ds = g.load_real(data_path, args.instances, args.points, args.seed)
     print("loaded: " + ", ".join(f"{c}={len(v[0])}" for c, v in ds.items()))
+    if not ds:
+        ap.error(f"no usable class data found in {data_path.resolve()}")
 
     refs = {}
     if args.refs and Path(args.refs).is_file():
@@ -163,7 +177,7 @@ def main():
     results, _, _ = g.evaluate(ds, canon, args.rotations, args.seed,
                                want_features=False)
 
-    write_report(args.out, results, {"data": Path(args.data).resolve(),
+    write_report(args.out, results, {"data": data_path.resolve(),
                                      "instances": args.instances,
                                      "rotations": args.rotations,
                                      "refs": args.refs if refs else "none"})

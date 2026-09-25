@@ -4,10 +4,10 @@
 Class-conditional geometric canonicalisation of arbitrarily rotated point clouds.
 
 No learning, no weights, no training data.  Given a point cloud and its class
-label (airplane / car / chair / table / bowl) the pipeline computes a canonical
+label and a recipe loaded from rules.json the pipeline computes a canonical
 rotation R in SO(3) by a deterministic sequence of geometric constructions:
 
-    principal axes -> symmetry detection -> class-specific semantic rule -> frame
+    principal axes -> symmetry detection -> stored geometric recipe -> frame
 
 and then measures
 
@@ -41,71 +41,21 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
+if __package__:
+    from .rule_database import Operation, RuleDatabase
+else:  # direct script execution, as used by the demo and CLI
+    from rule_database import Operation, RuleDatabase
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
 
-SYNSET_TO_CLASS = {
-    "02691156": "airplane",
-    "02958343": "car",
-    "03001627": "chair",
-    "04379243": "table",
-    "02880940": "bowl",
-    "03642806": "laptop",
-    "02818832": "bed",
-    "02876657": "bottle",
-    "03467517": "guitar",
-    "04256520": "sofa",
-    # ModelNet classes.  Those that also exist in ShapeNet keep their synset so
-    # a raw ShapeNet tree still resolves; door, toilet and wardrobe have none,
-    # and load_real finds them by class name.
-    "02808440": "bathtub",
-    "02828884": "bench",
-    "02871439": "bookshelf",
-    "03085013": "keyboard",
-    "03636649": "lamp",
-    "03211117": "monitor",
-    "03928116": "piano",
-    "03991062": "flower_pot",
-}
-CLASS_ORDER = ["airplane", "car", "chair", "table", "bowl",
-               "laptop", "bed", "bottle", "guitar", "sofa",
-               "bathtub", "bench", "bookshelf", "door", "flower_pot",
-               "keyboard", "lamp", "monitor", "piano", "toilet", "wardrobe",
-               "cone", "sink", "stool", "vase"]
 
 # Symmetry group of each class in CANONICAL coordinates (z = up, x = forward).
 # "I"     : trivial, the frame is fully determined
 # "C2z"   : 180 deg about canonical z is a self-map
 # "C4z"   : 90 deg steps about canonical z
 # "Cinfz" : any rotation about canonical z (surface of revolution)
-DEFAULT_SYMMETRY = {
-    "airplane": "I",
-    "car": "I",
-    "chair": "I",
-    "table": "C2z",     # upgraded per instance to C4z / Cinfz when the top is square / round
-    "bowl": "Cinfz",
-    "laptop": "I",
-    "bed": "I",
-    "bottle": "Cinfz",
-    "guitar": "I",
-    "sofa": "I",
-    "bathtub": "I",
-    "bench": "I",
-    "bookshelf": "I",
-    "door": "C2z",      # a door slab maps onto itself through its own height
-    "flower_pot": "Cinfz",
-    "keyboard": "C2z",
-    "lamp": "Cinfz",
-    "monitor": "I",
-    "piano": "I",
-    "toilet": "I",
-    "wardrobe": "I",
-    "cone": "Cinfz",
-    "sink": "I",
-    "stool": "I",
-    "vase": "Cinfz",
-}
 
 SIGMA_MATCH = 0.05      # tolerance of the symmetry matching kernel (cloud has rms radius 1)
 N_PROBE = 320           # points used to score a candidate symmetry
@@ -1053,7 +1003,7 @@ def _circle_argmax(X, n, fn, n_samples=180, refine=3):
     return unit(math.cos(best_phi) * u + math.sin(best_phi) * v), float(best_val)
 
 
-def rule_airplane(shape):
+def winged_frame(shape):
     """Use bilateral wings, their plane, then dorsal fin and end profiles.
 
     The fin is read before choosing the nose: choosing a tail from one narrow
@@ -1165,42 +1115,89 @@ def rule_airplane(shape):
                                  "symmetry": "I"}
 
 
-def rule_car(shape):
-    """Mirror plane normal is the lateral axis.  Inside the plane the long axis
-    is the travel direction and the short one is vertical.  The body is wide at
-    the wheels and narrow at the roof, and the cabin sits behind the centre."""
+def bilateral_frame(shape, lateral="mirror", up_axis="plate", interior_only=True,
+                    min_frac=0.08, plate_cue="plate", project_up=True,
+                    up_sign="support", forward="crown", crown_pct=50):
+    """Compose lateral, vertical and sign cues selected by a stored recipe."""
     X = shape.X
-    lat, mscore = best_mirror(shape)
-    got = plate_axis(X, lat, min_frac=0.10)       # roof / floor pan
-    if got is not None:
-        up = got[0]
-        fwd = unit(np.cross(lat, up))
-        cue = "body_plate"
+    info = {}
+    if lateral == "mirror":
+        lat, info["mirror_score"] = best_mirror(shape)
     else:
-        fwd, up, _, _ = _plane_pca_axes(X, lat)
-        cue = "plane_pca"
-
-    # The wide end goes at the bottom, and nothing gets to overrule that.
-    # support_score used to have the last word here and was wrong more often
-    # than a coin: it rewards a sparse wide end, and a car's greenhouse is
-    # exactly that, so it read the roof as the floor and parked 44% of the
-    # class on its head.  taper_sign alone: 92.7%.  See top_is_shorter.
-    if taper_sign(X, up) < 0:
+        lat = unit(shape.V[:, 0])
+    if up_axis == "support":
+        up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
+        cue = "support"
+    else:
+        got = plate_axis(X, lat, interior_only=interior_only, min_frac=min_frac)
+        if got is not None:
+            up, cue = got[0], plate_cue
+        elif up_axis == "plate_or_pca":
+            fwd, up, _, _ = _plane_pca_axes(X, lat)
+            cue = "plane_pca"
+        else:
+            up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
+            cue = "support"
+    if forward == "roof_offset":
+        # Historically chosen before signing up; preserve that ordering.
+        if up_axis != "plate_or_pca" or got is not None:
+            fwd = unit(np.cross(lat, up))
+    if project_up:
+        up = unit(up - (up @ lat) * lat)
+    if up_sign == "upper_structure":
+        vote = upper_structure_vote(X, up)
+        info["up_confidence"] = abs(vote)
+        positive = vote >= 0
+    elif up_sign == "taper":
+        positive = taper_sign(X, up) >= 0
+    else:
+        positive = UP_SIGNS[up_sign](X, up)
+    if not positive:
         up = -up
+    if forward != "roof_offset":
+        fwd = unit(np.cross(lat, up))
+    h = X @ up
+    if forward == "crown_vote":
+        fwd, info["forward_confidence"] = crown_direction(X, up, fwd)
+    elif forward == "roof_offset":
+        hi, span = h.max(), max(h.max() - h.min(), EPS)
+        offset = 0.0
+        for band in (0.15, 0.20, 0.25):
+            mask = h >= hi - band * span
+            if mask.sum() >= 10:
+                value = float((X[mask] @ fwd).mean())
+                if abs(value) > abs(offset):
+                    offset = value
+        if offset > 0:
+            fwd = -fwd
+        info["roof_offset"] = abs(offset)
+    else:
+        crown = X[h >= float(np.percentile(h, crown_pct))]
+        if len(crown) > 10 and float((crown @ fwd).mean()) > 0:
+            fwd = -fwd
+    return frame_from(fwd, up), dict(info, up_cue=cue, symmetry="I")
 
-    h = X @ up                                    # the cabin sits behind the centre
-    hi, span_ = h.max(), max(h.max() - h.min(), EPS)
-    offset = 0.0
-    for band in (0.15, 0.20, 0.25):               # take the most decisive band
-        m = h >= hi - band * span_
-        if m.sum() >= 10:
-            o = float((X[m] @ fwd).mean())
-            if abs(o) > abs(offset):
-                offset = o
-    if offset > 0:
+
+def principal_frame(shape, up_axis=0, fwd_axis=2, end_frac=0.25):
+    """An elongated planar shape: narrow end up, positive face skew forward."""
+    X = shape.X
+    up, fwd = unit(shape.V[:, up_axis]), unit(shape.V[:, fwd_axis])
+    lo, hi = end_spread(X, up, frac=end_frac)
+    if hi > lo:
+        up = -up
+    if float(((X @ fwd) ** 3).mean()) < 0:
         fwd = -fwd
-    return frame_from(fwd, up), {"mirror_score": mscore, "roof_offset": abs(offset),
-                                 "up_cue": cue, "symmetry": "I"}
+    return frame_from(fwd, up), {"symmetry": "I"}
+
+
+def crown_forward(shape, R, info):
+    forward, confidence = crown_direction(shape.X, R[2], R[0])
+    return frame_from(forward, R[2]), dict(info, forward_confidence=confidence)
+
+
+def axial_symmetry(shape, R, info, allow=("C2z", "C4z", "Cinfz"), min_score=0.0):
+    symmetry, scores = detect_axial_symmetry(shape, R[2], allow=allow, min_score=min_score)
+    return R, dict(info, symmetry=symmetry, sym_scores=scores)
 
 
 def plate_sweep(X, n, n_samples=180, width=0.06):
@@ -1257,38 +1254,6 @@ def plate_axis(X, lat, width=0.06, interior_only=False, min_frac=0.08,
     return unit(d), float(frac), float(centre), float(rel)
 
 
-def rule_chair(shape):
-    """Mirror plane normal is the lateral axis.  Up is the normal of the seat,
-    found as the strongest plate sitting in the interior of its own extent.  The
-    legs fix which way is up and the backrest fixes which way is forward."""
-    X = shape.X
-    lat, mscore = best_mirror(shape)
-    got = plate_axis(X, lat, interior_only=True)
-
-    if got is not None:
-        up, frac, centre, _ = got
-        cue = "seat_plate"
-    else:                                          # stool or heavily curved seat
-        up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
-        cue = "support"
-
-    # Which way is down.  support_score answers this well for a table but not
-    # for a chair, where it scored 52.9% -- a chair's back is sparse and wide
-    # and reads as a set of legs.  The backrest covers only part of the seat,
-    # so extent separates them where mass does not: 82.4%.
-    if not top_is_shorter(X, up):
-        up = -up
-
-    fwd = unit(np.cross(lat, up))
-    h = X @ up                                     # backrest sits above the seat
-    seat_h = float(np.median(h))
-    upper = X[h >= seat_h]
-    if len(upper) > 10 and float((upper @ fwd).mean()) > 0:
-        fwd = -fwd
-    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
-                                 "symmetry": "I"}
-
-
 def detect_axial_symmetry(shape, up, allow=("C2z", "C4z", "Cinfz"), min_score=0.0):
     """Measure, rather than assume, the rotational symmetry about the up axis.
 
@@ -1327,7 +1292,7 @@ def detect_flip_symmetry(shape, fwd, factor=1.30):
                                                           "generic": generic}
 
 
-def rule_table(shape):
+def platform_frame(shape):
     """Up is the normal of the dominant flat plate, which is the top, refined by
     fitting that plate.  In plane, the long side of the top's minimum-area
     rectangle becomes x.  The top's outline sets the symmetry group."""
@@ -1386,231 +1351,18 @@ def rule_table(shape):
                                       "symmetry": sym, "sym_scores": sd}
 
 
-def rule_bowl(shape):
-    """A bowl is a surface of revolution, so its axis is the covariance
-    eigenvector with the isolated eigenvalue; the rotational symmetry score
-    confirms it.  The open side is the one with the larger radius."""
-    X = shape.X
-    scores = np.array([shape.rot_score(d) for d in shape.cands])
-    axis = unit(shape.cands[int(np.argmax(scores))])
-
-    k = int(np.argmax([abs(shape.V[:, i] @ axis) for i in range(3)]))
-    axis = unit(shape.V[:, k])                    # snap to the exact eigenvector
-    if shape.V[:, k] @ (shape.cands[int(np.argmax(scores))]) < 0:
-        axis = -axis
-
-    lo, hi = end_spread(X, axis, frac=0.22)       # rim is wide, base is narrow
-    up = axis if hi >= lo else -axis
-    sym, sd = detect_axial_symmetry(shape, up)
-    j = 0 if k != 0 else 1                        # any equivariant in-plane seed
-    seed = shape.V[:, j] - (shape.V[:, j] @ up) * up
-    fwd = unit(seed) if np.linalg.norm(seed) > 1e-6 else complement(up)[0]
-    return frame_from(fwd, up), {"rot_score": float(scores.max()), "symmetry": sym,
-                                 "sym_scores": sd}
-
-
 # ----------------------------------------------------------------------------
 # Five more classes, on the same skeleton: a lateral axis, an up axis, and the
 # signs that separate front from back.  What differs between them is only which
 # cue is trusted for each, and the docstrings say what was measured to pick it.
 # ----------------------------------------------------------------------------
 
-def rule_laptop(shape):
-    """Mirror normal is lateral, a plate gives up, the screen fixes forward.
-
-    Structurally this is rule_chair: both objects are bilaterally symmetric,
-    both rest on a flat underside, and in both the tall part sits above and
-    behind.  A laptop has two panels where a chair has one seat, but the
-    interior-plate test still resolves them, and the panel it settles on is
-    consistent enough across instances to carry the frame.
-
-    Up is the base panel's normal, found as a plate the way rule_chair finds a
-    seat.  The support cue is deliberately NOT used to choose this direction:
-    it rewards the widest ground footprint, and a laptop resting on the two
-    outer edges of its panels -- hinge in the air, an inverted V -- spreads
-    wider than one sitting on its base, so support alone lands every instance
-    in a tent pose and picks between tents inconsistently.  Measured: support
-    gives 81 deg RMS across five instances, the plate gives 34.  Laptop is the
-    hard case of these five: its two largest eigenvalues are nearly equal
-    (lam1/lam2 ~ 1.2), so the PCA pre-frame can swap axes between poses and the
-    rule inherits that wobble.
-    """
-    X = shape.X
-    lat, mscore = best_mirror(shape)
-
-    got = plate_axis(X, lat, interior_only=True)
-    if got is None:                               # no clean panel: fall back
-        up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
-        cue = "support"
-    else:
-        up, cue = got[0], "plate"
-    up = unit(up - (up @ lat) * lat)              # keep the frame orthogonal
-
-    if support_score(X, up) < support_score(X, -up):   # support fixes only the sign
-        up = -up
-
-    fwd = unit(np.cross(lat, up))
-    h = X @ up
-    upper = X[h >= float(np.median(h))]           # screen half
-    if len(upper) > 10 and float((upper @ fwd).mean()) > 0:
-        fwd = -fwd
-    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
-                                 "symmetry": "I"}
-
-
-def rule_bed(shape):
-    """Mattress plane gives up, headboard gives forward.
-
-    A broad horizontal platform with a tall part at one end, which is
-    rule_chair's situation exactly.  up comes from the platform plate rather
-    than from support, for the reason rule_laptop documents: support rewards
-    the widest footprint, not the surface the object actually rests on.
-    Spatial end bands sign up toward the short headboard rather than the
-    full-length underside; support mass alone often inverts a solid bed base.
-    """
-    X = shape.X
-    lat, mscore = best_mirror(shape)
-
-    got = plate_axis(X, lat, interior_only=True)
-    if got is None:
-        up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
-        cue = "support"
-    else:
-        up, cue = got[0], "plate"
-    up = unit(up - (up @ lat) * lat)
-    up_vote = upper_structure_vote(X, up)
-    if up_vote < 0:
-        up = -up
-
-    fwd = unit(np.cross(lat, up))
-    # The headboard is the top slice, not merely the upper half: a bed is
-    # mostly mattress, so a median split is dominated by the platform and the
-    # sign it returns is close to a coin toss.
-    fwd, confidence = crown_direction(X, up, fwd)
-    return frame_from(fwd, up), {"mirror_score": mscore, "up_cue": cue,
-                                 "forward_confidence": confidence,
-                                 "up_confidence": abs(up_vote),
-                                 "symmetry": "I"}
-
-
-def rule_sofa(shape):
-    """Long axis gives lateral, support gives up, backrest gives forward.
-
-    Deliberately does NOT use best_mirror, unlike bed.  Measured on twenty
-    sofas, the mirror normal drifts by up to 88 degrees between poses of the
-    *same* cloud (bed and guitar: 0.0), because a sofa is close enough to a box
-    to offer several competing near-equal mirror planes and the grid search
-    settles into different ones.  That wobble was the whole of the rule's
-    instability: taking the lateral axis from the inertia tensor instead, where
-    lam1/lam2 is ~3.7 and nothing is tied, takes stability from 6.49 to 0.00 and
-    halves the median disagreement.
-    """
-    X = shape.X
-    lat = unit(shape.V[:, 0])                     # a sofa's long axis runs across it
-
-    up, _ = _circle_argmax(X, lat, lambda d: support_score(X, d))
-    up = unit(up - (up @ lat) * lat)
-    if support_score(X, up) < support_score(X, -up):
-        up = -up
-
-    fwd = unit(np.cross(lat, up))
-    h = X @ up
-    crown = X[h >= float(np.percentile(h, 72))]   # backrest
-    if len(crown) > 10 and float((crown @ fwd).mean()) > 0:
-        fwd = -fwd
-    return frame_from(fwd, up), {"up_cue": "support", "symmetry": "I"}
-
-
-def rule_bottle(shape):
-    """A bottle is a surface of revolution, so the axis is the eigenvector with
-    the isolated eigenvalue and the rotational score confirms it.
-
-    This is rule_bowl with the sign reversed: a bowl's wide end is its rim and
-    points up, a bottle's wide end is its base and points down.
-    """
-    X = shape.X
-    scores = np.array([shape.rot_score(d) for d in shape.cands])
-    axis = unit(shape.cands[int(np.argmax(scores))])
-
-    k = int(np.argmax([abs(shape.V[:, i] @ axis) for i in range(3)]))
-    snapped = unit(shape.V[:, k])                 # snap to the exact eigenvector
-    if snapped @ axis < 0:
-        snapped = -snapped
-    axis = snapped
-
-    lo, hi = end_spread(X, axis, frac=0.22)       # base is wide, neck is narrow
-    up = axis if lo >= hi else -axis
-    sym, sd = detect_axial_symmetry(shape, up)
-
-    j = 0 if k != 0 else 1                        # any equivariant in-plane seed
-    seed = shape.V[:, j] - (shape.V[:, j] @ up) * up
-    fwd = unit(seed) if np.linalg.norm(seed) > 1e-6 else complement(up)[0]
-    return frame_from(fwd, up), {"rot_score": float(scores.max()),
-                                 "symmetry": sym, "sym_scores": sd}
-
-
-def rule_guitar(shape):
-    """Near-planar and very elongated, which makes two of the three axes free.
-
-    lambda3 is ~0.4% of the trace, so the body plane is unambiguous, and
-    lambda1/lambda2 is ~10, so the neck axis is unambiguous.  Neither needs a
-    cue -- the inertia tensor already separates them cleanly.  All that is left
-    is three signs.
-
-    best_mirror must NOT be used here, which cost a version to learn.  A guitar
-    is near-planar, and reflecting a flat object through its own plane is almost
-    an exact symmetry, so the strongest mirror is sometimes the body plane and
-    sometimes the left-right plane: across twenty instances it split 10/10
-    between PC3 and PC2.  A cue that bistable rotates the frame about the neck
-    by ~90 degrees on half the class.
-
-    The neck ends up along +z on all 20, which is the axis that matters.  The
-    face-vs-back sign is the part that does not work: five different cues were
-    measured and none beat a third moment, and the residual is not a clean 180
-    degree flip either (quotienting one out still leaves ~29 degrees), so this
-    is reported as a partial result rather than dressed up with a symmetry
-    group it does not have.
-    """
-    X = shape.X
-    up = unit(shape.V[:, 0])                      # neck-to-body long axis
-    fwd = unit(shape.V[:, 2])                     # body-plane normal
-
-    lo, hi = end_spread(X, up, frac=0.25)
-    if hi > lo:                                   # body is the wide end: put it down
-        up = -up
-    if float(((X @ fwd) ** 3).mean()) < 0:        # face vs back, by third moment
-        fwd = -fwd
-    return frame_from(fwd, up), {"symmetry": "I"}
-
 
 # ----------------------------------------------------------------------------
-# Three skeletons and the eleven classes built on them.
-#
-# Every rule below is one skeleton plus a choice of cue, and the choice was
-# measured rather than argued.  The ModelNet clouds these classes come from are
-# stored z-up and azimuth aligned, so the angle between the rule's canonical z
-# and the stored z is ground truth needing no convention; the azimuth is scored
-# as agreement across instances, because ModelNet's idea of 'front' need not be
-# this pipeline's and a whole-frame comparison cannot tell those apart.
-#
-#   class        skeleton     up axis   up sign      up<15 deg   azimuth median
-#   bathtub      upright      plate     wide end up      25%        34 deg
-#   bench        upright      plate     support          58%        91 deg
-#   bookshelf    upright      tallest   floor            25%       110 deg
-#   door         slab         PC1       third moment     64%         4 deg
-#   flower_pot   revolution   rot axis  wide end up      79%        11 deg
-#   keyboard     slab         PC3       third moment     64%        58 deg
-#   lamp         revolution   rot axis  wide end up      57%        13 deg
-#   monitor      upright      tallest   wide end up      42%        19 deg
-#   piano        (own)        PC3|PC2   support          68%        -- see rule_piano
-#   toilet       (own)        profile   wide end up      65%        -- see rule_toilet
-#   wardrobe     upright      tallest   top_is_shorter    8%       104 deg
-#
-# door, flower_pot, lamp and keyboard work.  bathtub, bench, monitor and piano
-# find up more often than not.  bookshelf, toilet and wardrobe do not work and
-# are reported rather than dressed up: a wardrobe is a box, and a box upside
-# down is still a box, so there is no geometric cue to read.
+# Reusable sign cues and frame constructors. Class-specific choices live in
+# rules.json; see RULE_DATABASE.md for the operation contract and extension guide.
 # ----------------------------------------------------------------------------
+
 
 def _sign_support(X, u):
     return support_score(X, u) >= support_score(X, -u)
@@ -1705,10 +1457,11 @@ def upright_frame(shape, up_axis="plate", up_sign="support", crown_pct=72,
                                  "symmetry": sym, "flip_scores": sc}
 
 
-def revolution_frame(shape, wide_end_up=True):
+def revolution_frame(shape, wide_end_up=True, sign_forward=True,
+                     narrow_tie_up=False, end_frac=0.22):
     """A surface of revolution: the axis carries everything, the azimuth is
-    free, and the only question is which end of the axis is up.  rule_bowl and
-    rule_bottle are the same construction with the sign decided per class."""
+    free, and the only question is which end of the axis is up. Stored
+    recipes select the end sign and whether to sign the in-plane seed."""
     X = shape.X
     scores = np.array([shape.rot_score(d) for d in shape.cands])
     axis = unit(shape.cands[int(np.argmax(scores))])
@@ -1716,13 +1469,15 @@ def revolution_frame(shape, wide_end_up=True):
     snapped = unit(shape.V[:, k])                  # snap to the exact eigenvector
     axis = snapped if snapped @ axis > 0 else -snapped
 
-    lo, hi = end_spread(X, axis, frac=0.22)
+    lo, hi = end_spread(X, axis, frac=end_frac)
     up = axis if ((hi >= lo) == wide_end_up) else -axis
+    if narrow_tie_up and hi == lo:
+        up = axis
     sym, sd = detect_axial_symmetry(shape, up)
     j = 0 if k != 0 else 1                         # any equivariant in-plane seed
     seed = shape.V[:, j] - (shape.V[:, j] @ up) * up
     fwd = unit(seed) if np.linalg.norm(seed) > 1e-6 else complement(up)[0]
-    if float(np.mean((X @ fwd) ** 3)) < 0:
+    if sign_forward and float(np.mean((X @ fwd) ** 3)) < 0:
         fwd = -fwd
     return frame_from(fwd, up), {"rot_score": float(scores.max()),
                                  "symmetry": sym, "sym_scores": sd}
@@ -1746,7 +1501,7 @@ def slab_frame(shape, up_axis=0, fwd_axis=2, up_sign="third"):
     return frame_from(fwd, up), {"symmetry": "C2z"}
 
 
-def rule_bathtub(shape):
+def open_basin_frame(shape):
     """An elongated open basin: closed floor below, open rim above.
 
     Evaluate both signs of candidate normals using central coverage of the
@@ -1789,73 +1544,12 @@ def rule_bathtub(shape):
                                 "symmetry": sym, "sym_scores": scores}
 
 
-def rule_bench(shape):
-    """Terminal or interior seat, support below, optional backrest above.
-
-    Multiple crown bands sign forward when there is a back. A backless bench
-    may have a half-turn yaw symmetry, but a seat on legs is not generally
-    unchanged by turning it upside down. Require both a strong absolute
-    match and separation from generic rotations before reporting C2z.
-    """
-    R, info = upright_frame(shape, "sharpest", "support")
-    forward, confidence = crown_direction(shape.X, R[2], R[0])
-    R = frame_from(forward, R[2])
-    # Backless benches have a yaw ambiguity, not automatically an up/down
-    # ambiguity. Test the actual rotation instead of assigning it by label.
-    symmetry, scores = detect_axial_symmetry(shape, R[2], allow=("C2z",), min_score=0.65)
-    return R, dict(info, forward_confidence=confidence,
-                   symmetry=symmetry, sym_scores=scores)
-
-
-def rule_bookshelf(shape):
-    """A box: up is the tallest principal axis, support signs it.
-
-    plate_axis locks onto the back panel, whose normal is horizontal, so the
-    plate cue lands the frame 83 deg out.  The axis is not really the hard
-    part once it is taken from the object's own axes -- 1.2 deg out, 85% --
-    but the sign is: a bookshelf with evenly spaced shelves has no up.  Best
-    measured sign is support at 43% within 15 deg, up from 25%.
-
-    A shelf-counting cue was measured and rejected: scoring a direction by how
-    comb-like the density is along it puts the axis 39 deg out (40%), because
-    the back panel is one large flat plate and outweighs four shelves.
-
-    The sign comes from base_coverage -- the base is a closed panel and fills
-    the footprint where the top does not -- which reads 50% against support's
-    43% and leaves the frame stable.
-
-    Where it cannot work is where there is nothing to read: a bookcase with no
-    back and no shelves is an open tube with a flat panel at each end, and it
-    is genuinely unchanged by being turned over.  detect_flip_symmetry tests
-    that per instance and reports C2x when it holds, so those instances are
-    measured against their own symmetry instead of being marked wrong."""
-    return upright_frame(shape, "principal", "base", flip_symmetry=True)
-
-
-def flat_panel_frame(shape):
-    """One frame for every thin rectangular panel, whatever it is called.
-
-    Uni3D cannot reliably tell a door from a keyboard, and no geometric rule
-    can either: both are a rectangle a few centimetres thick, and once the
-    cloud is normalised the only difference is an aspect ratio that the two
-    classes overlap on.  Rather than let a coin-flip label choose between two
-    conventions, both classes get this one, so a misprediction costs nothing --
-    the canonical pose is the same either way.
-
-    The convention is up along the long axis, forward along the panel normal,
-    signed by the flat foot.  Both of the other two were measured and are
-    worse: pointing up along the normal instead makes the panel's face the
-    sign that matters, and which face a door shows is exactly the thing no cue
-    can read, so the azimuth falls apart (door 83 deg median against 4 deg).
-    Signing the long axis by the third moment rather than the foot costs the
-    keyboard (74 deg against 27 deg).  A keyboard therefore canonicalises
-    standing on its edge, which is the price of the two classes agreeing."""
-    R, info = slab_frame(shape, up_axis=0, fwd_axis=2, up_sign="floor")
+def panel_symmetry(shape, R, info, min_score=0.75):
     # Featureless slabs have three proper half-turns, not just yaw. A strong
     # self-match is required on every generator and its product; this is a
     # measured ambiguity, not permission to ignore a bad semantic sign.
     scores = [float(shape.rot_score(axis, angles=(np.pi,))) for axis in R]
-    valid = [score >= 0.75 for score in scores]
+    valid = [score >= min_score for score in scores]
     if all(valid):
         symmetry = "D2"
     elif valid[2]:
@@ -1869,52 +1563,7 @@ def flat_panel_frame(shape):
     return R, dict(info, symmetry=symmetry, half_turn_scores=scores)
 
 
-def rule_door(shape):
-    """A door is a flat panel; see flat_panel_frame for why it shares its
-    frame with the keyboard.  Its axes are the cleanest of these eleven --
-    the panel normal is 0.6 deg out and the azimuth agrees to 4 deg."""
-    return flat_panel_frame(shape)
-
-
-def rule_flower_pot(shape):
-    """A surface of revolution whose rim is wide and points up, like a bowl.
-    The best of these eleven: up within 15 deg on 79%, azimuth 11 deg."""
-    return revolution_frame(shape, wide_end_up=True)
-
-
-def rule_keyboard(shape):
-    """A keyboard is a flat panel; see flat_panel_frame.  It shares its frame
-    with the door on purpose, because the classifier cannot separate them.
-
-    Putting the keys upward was tried and cannot be done from this data.  The
-    idea is sound -- one face is a plain panel and the other carries keys --
-    but these models are 10 to 17 times wider than they are thick, and their
-    two faces sample almost identically.  Six cues were measured against the
-    stored orientation: surface roughness at each face 45%, denser face 55%,
-    mass above the midplane 40%, base coverage 40%, sharper density peak 30%,
-    third moment 60%.  Nothing clears 60% on twenty models, which is two
-    models away from a coin toss. Residual half-turns are now measured: a
-    featureless slab can be D2, while a resolved asymmetric panel can be I."""
-    return flat_panel_frame(shape)
-
-
-def rule_lamp(shape):
-    """Shade up.  A lamp is a surface of revolution and its wide end is the
-    shade, not the base -- signing it the other way is 178 deg wrong on every
-    instance, which is as clean a confirmation as this file has."""
-    return revolution_frame(shape, wide_end_up=True)
-
-
-def rule_monitor(shape):
-    """A screen on a stand: the screen is the wide end and it is at the top.
-
-    The plate cue fails because the panel it finds is the screen itself, whose
-    normal is horizontal (89 deg out).  With up taken from a principal axis and
-    signed by the wide end, 79% land within 15 deg, up from 42%."""
-    return upright_frame(shape, "principal", "wide_up")
-
-
-def rule_piano(shape):
+def supported_case_frame(shape):
     """Two shapes share this class, so the rule first tells them apart.
 
     A grand stands on three legs under a flat case, so the low end of its
@@ -1929,7 +1578,7 @@ def rule_piano(shape):
     An upright is a box standing on end: PC1 runs across the keyboard, up is
     PC2, signed by support (the keyboard brackets), and forward is the thin
     PC3.  Taken from the inertia tensor rather than best_mirror for the same
-    reason as rule_sofa: through the mirror, two near-cubic instances wandered
+    reason as a wide-backed seat: through the mirror, two near-cubic instances wandered
     60-80 deg between poses of the same cloud.
 
     Measured on 25 instances against the stored z-up, the old rule (lid plate,
@@ -1971,7 +1620,7 @@ def rule_piano(shape):
     return frame_from(fwd, up), {"up_cue": "grand_legs", "symmetry": "I"}
 
 
-def rule_toilet(shape):
+def profile_box_frame(shape):
     """Reported as a failure: up lands within 15 deg on 36% of instances.
 
     The shape is right there -- a bowl at mid height, a cistern standing at the
@@ -2043,26 +1692,7 @@ def rule_toilet(shape):
                                  "symmetry": "I"}
 
 
-def rule_wardrobe(shape):
-    """A box, so up is a principal axis and the third moment signs it.
-
-    The axis is easy once taken from the object's own axes (0.9 deg, 80%).
-    The sign is not: a wardrobe upside down is still a wardrobe.  base_coverage
-    and the third moment tie exactly here at 57% within 15 deg, up from 8%, and
-    coverage is the one kept because it is the same argument the bookshelf
-    makes.  A weak cue rather than a real one -- do not quote this class.
-
-    Flip symmetry is tested per instance for the same reason as the bookshelf:
-    a plain box really is unchanged by turning it over."""
-    return upright_frame(shape, "principal", "base", flip_symmetry=True)
-
-
-def rule_cone(shape):
-    """Axial solid: broad base below the apex, with measured yaw symmetry."""
-    return revolution_frame(shape, wide_end_up=False)
-
-
-def rule_vase(shape):
+def end_closure(shape, R, info, min_score=0.65):
     """Open vessel; the closed base fixes up even when the neck is narrow.
 
     Width alone cannot distinguish a flared pot from a narrow-necked vase.
@@ -2071,7 +1701,6 @@ def rule_vase(shape):
     narrow neck is not mistaken for a filled base. Low confidence remains
     explicit when neither end has enough interior samples.
     """
-    R, info = revolution_frame(shape, wide_end_up=True)
     X, up = shape.X, R[2]
     _, centre, _ = slab_peak(X, up, width=0.06)
     normal, flat = plane_normal_of_slab(X, up, centre, width=0.08)
@@ -2094,7 +1723,7 @@ def rule_vase(shape):
     vote = float(np.median(votes))
     if vote < 0:
         up = -up
-    symmetry, scores = detect_axial_symmetry(shape, up, min_score=0.65)
+    symmetry, scores = detect_axial_symmetry(shape, up, min_score=min_score)
     return frame_from(R[0], up), dict(info, up_cue="local_end_closure",
                                      up_confidence=abs(vote), symmetry=symmetry,
                                      sym_scores=scores)
@@ -2125,7 +1754,6 @@ OCTAHEDRAL = octahedral_rotations()
 # table or a bowl is symmetric about its own vertical, so several attitudes are
 # genuinely equivalent, the nearest-reference choice among them is arbitrary,
 # and forcing one costs accuracy instead of adding any.
-REFERENCE_CLASSES = ("airplane", "car", "chair", "bed", "bathtub")
 
 # How many shape clusters each class's reference is split into.  One means a
 # single ensemble, which is right for classes whose members look alike.
@@ -2146,12 +1774,10 @@ REFERENCE_CLASSES = ("airplane", "car", "chair", "bed", "bathtub")
 # the cluster assignment.  Airplane clusters are not cleanly separated, so a
 # borderline plane lands in different clusters for different input poses.  They
 # keep a single ensemble.
-CLUSTERS_PER_CLASS = {"chair": 4, "car": 4}
 # Bed and bathtub references are supported by disjoint validation: they repair
 # ambiguous head/foot signs and occasional plate-axis swaps. The same trial
 # regressed monitor/piano and did not fix sofa/toilet, so those remain rules
 # only. Every ICP correction remains bounded to 25 degrees.
-REFINE_CLASSES = ("airplane", "car", "chair", "bed", "bathtub")
 
 
 def _one_way_chamfer(P, tree):
@@ -2270,7 +1896,7 @@ def _align_clusters(groups):
 
 
 def build_reference(clouds, cls, rule_canon, max_ref=10, n_pts=384, seed=0,
-                    n_clusters=None):
+                    n_clusters=None, *, rule_database=None):
     """Reference attitude for a class: ensembles of its own instances, turned
     into agreement with each other.
 
@@ -2281,7 +1907,10 @@ def build_reference(clouds, cls, rule_canon, max_ref=10, n_pts=384, seed=0,
     The rules still have to get the frame right up to an axis swap, because that
     is all this repairs.  The ensembles come from the first `max_ref` instances,
     so their own numbers are optimistic; judge the method on the rest."""
-    n_clusters = CLUSTERS_PER_CLASS.get(cls, 1) if n_clusters is None else n_clusters
+    database = RULE_DATABASE if rule_database is None else rule_database
+    cls = database.canonical_name(cls)
+    policy = database.reference_policy(cls)
+    n_clusters = policy.get("clusters", 1) if n_clusters is None else n_clusters
     rng = np.random.default_rng(seed)
     Ps, feats = [], []
     for X in clouds[:max_ref]:
@@ -2302,7 +1931,7 @@ def build_reference(clouds, cls, rule_canon, max_ref=10, n_pts=384, seed=0,
     mu, sd = F.mean(0), F.std(0) + EPS
     Fz = (F - mu) / sd
 
-    if cls == "airplane":
+    if policy.get("preserve_semantics", False):
         # Keep the semantic attitude of the rules. Free joint alignment can
         # turn an entire ensemble tail-first, then undo a correct fin cue on
         # every unseen aircraft. Shape matching only resolves weak axes.
@@ -2356,7 +1985,7 @@ def refine_to_reference(P, tree, Q, max_deg=25.0, iters=6, trim=0.7):
     return R if ang <= max_deg else np.eye(3)
 
 
-def save_references(path, refs, extra=None):
+def save_references(path, refs, extra=None, *, rule_database=None):
     """Write the built references to a .npz so they never have to be rebuilt.
 
     The file carries the clouds of every cluster plus the feature statistics
@@ -2364,8 +1993,10 @@ def save_references(path, refs, extra=None):
     were built with the principal-axis pre-canonicalisation on.  Aligning a new
     cloud under a different setting from the one the references were built with
     would silently mis-assign, so the setting travels with the file."""
+    database = RULE_DATABASE if rule_database is None else rule_database
     arrays, meta = {}, {"pca_first": bool(PCA_FIRST), "classes": {},
-                        "ruleset_version": RULESET_VERSION}
+                        "ruleset_version": RULESET_VERSION,
+                        "rules_fingerprint": database.fingerprint}
     for cls, ref in (refs or {}).items():
         if not ref or not ref.get("clusters"):
             continue
@@ -2385,12 +2016,14 @@ def save_references(path, refs, extra=None):
     return meta
 
 
-def load_references(path):
+def load_references(path, *, rule_database=None):
     """Read references written by save_references.  Returns (refs, meta)."""
+    database = RULE_DATABASE if rule_database is None else rule_database
     z = np.load(path, allow_pickle=False)
     meta = json.loads(bytes(z["__meta__"]).decode())
-    if meta.get("ruleset_version") != RULESET_VERSION:
-        warnings.warn("Reference cache predates the current orientation rules; "
+    if (meta.get("ruleset_version") != RULESET_VERSION or
+            meta.get("rules_fingerprint") != database.fingerprint):
+        warnings.warn("Reference cache has different or unrecorded orientation rules; "
                       "rebuild it with --save-reference before comparing results.",
                       UserWarning, stacklevel=2)
     refs = {}
@@ -2406,22 +2039,24 @@ def load_references(path):
     return refs, meta
 
 
-def make_canonicaliser(references=None, refine=True, refine_classes=None):
+def make_canonicaliser(references=None, refine=True, refine_classes=None, *, rule_database=None):
     """Bind class references to the pipeline.  Without them this is the plain
     rule-based canonicaliser."""
+    database = RULE_DATABASE if rule_database is None else rule_database
     store = {}
     for c, ref in (references or {}).items():
         if not ref or not ref.get("clusters"):
             continue
-        store[c] = {"trees": {j: [cKDTree(P) for P in Ps]
+        store[database.canonical_name(c)] = {"trees": {j: [cKDTree(P) for P in Ps]
                               for j, Ps in ref["clusters"].items()},
                     "pts": ref["clusters"],
                     "centres": ref["centres"], "mu": ref["mu"], "sd": ref["sd"],
                     "flat": ref.get("flat", False)}
 
     def canon(X, cls):
-        cls = canonical_class_name(cls)
-        R, info = canonicalise(X, cls)
+        cls = database.canonical_name(cls)
+        R, info = canonicalise(X, cls, rule_database=database)
+        policy = database.reference_policy(cls)
         ref = store.get(cls)
         if not ref:
             return R, info
@@ -2442,13 +2077,13 @@ def make_canonicaliser(references=None, refine=True, refine_classes=None):
         P = normalise_cloud(X)[0] @ R.T
         rotations = OCTAHEDRAL
         locked = []
-        if cls == "airplane":
+        if "lock_confidence" in policy:
             for axis, name in ((0, "forward"), (2, "up")):
-                if info.get(name + "_confidence", 0.0) >= 0.35:
+                if info.get(name + "_confidence", 0.0) >= policy["lock_confidence"]:
                     rotations = [F for F in rotations if F[axis, axis] > 0.99]
                     locked.append(name)
         F = snap_to_reference(P, ens, rotations=rotations,
-                              min_improvement=0.03 if cls == "airplane" else 0.0)
+                              min_improvement=policy.get("min_improvement", 0.0))
         R = F @ R
         tweak = 0.0
         if refine and (refine_classes is None or cls in refine_classes):
@@ -2457,12 +2092,12 @@ def make_canonicaliser(references=None, refine=True, refine_classes=None):
             M = refine_to_reference(Pf, ens[k], pl[k])
             R = M @ R
             tweak = math.degrees(math.acos(float(np.clip((np.trace(M) - 1) / 2, -1, 1))))
-        if cls == "bathtub":
+        if "recheck_symmetry" in policy:
             # A reference can swap the initial axes. Test symmetry about the
             # FINAL up axis, rather than carrying a stale C2z through a swap.
             info = dict(info)
             info["symmetry"], info["sym_scores"] = detect_axial_symmetry(
-                Shape(X), R[2], allow=("C2z",), min_score=0.65)
+                Shape(X), R[2], **policy["recheck_symmetry"])
         info = dict(info, cluster=int(j), snapped=bool(not np.allclose(F, np.eye(3))),
                     refined_deg=tweak, reference_locked_axes=locked)
         return R, info
@@ -2470,7 +2105,7 @@ def make_canonicaliser(references=None, refine=True, refine_classes=None):
     return canon
 
 
-def rule_generic(shape):
+def generic_frame(shape):
     """Fallback when the label is unknown: strongest mirror plane, support cue
     for up, longest remaining direction for forward."""
     X = shape.X
@@ -2483,16 +2118,61 @@ def rule_generic(shape):
     return frame_from(fwd, up), {"mirror_score": mscore, "symmetry": "I"}
 
 
-RULES = {"airplane": rule_airplane, "car": rule_car, "chair": rule_chair,
-         "table": rule_table, "bowl": rule_bowl, "laptop": rule_laptop,
-         "bed": rule_bed, "bottle": rule_bottle, "guitar": rule_guitar,
-         "sofa": rule_sofa, "bathtub": rule_bathtub, "bench": rule_bench,
-         "bookshelf": rule_bookshelf, "door": rule_door,
-         "flower_pot": rule_flower_pot, "keyboard": rule_keyboard,
-         "lamp": rule_lamp, "monitor": rule_monitor, "piano": rule_piano,
-         "toilet": rule_toilet, "wardrobe": rule_wardrobe,
-         "cone": rule_cone, "sink": rule_bathtub, "stool": rule_table,
-         "vase": rule_vase}
+# Only these geometric operations may appear in rule data.
+_SIGNS = tuple(UP_SIGNS)
+OPERATIONS = {
+    "bilateral": Operation(bilateral_frame, choices={
+        "lateral": ("mirror", "principal"),
+        "up_axis": ("plate", "plate_or_pca", "support"),
+        "up_sign": (*_SIGNS, "taper", "upper_structure"),
+        "forward": ("crown", "crown_vote", "roof_offset")}),
+    "upright": Operation(upright_frame, choices={
+        "up_axis": ("plate", "principal", "sharpest", "tallest"), "up_sign": _SIGNS}),
+    "revolution": Operation(revolution_frame),
+    "slab": Operation(slab_frame, choices={"up_sign": _SIGNS}),
+    "principal": Operation(principal_frame),
+    "winged": Operation(winged_frame),
+    "platform": Operation(platform_frame),
+    "open_basin": Operation(open_basin_frame),
+    "supported_case": Operation(supported_case_frame),
+    "profile_box": Operation(profile_box_frame),
+    "generic": Operation(generic_frame),
+    "crown_forward": Operation(crown_forward, modifier=True),
+    "axial_symmetry": Operation(axial_symmetry, modifier=True,
+                                choices={"allow": ("C2z", "C4z", "Cinfz")}),
+    "panel_symmetry": Operation(panel_symmetry, modifier=True),
+    "end_closure": Operation(end_closure, modifier=True),
+}
+DEFAULT_RULES_PATH = Path(__file__).with_name("rules.json")
+
+
+def load_rule_database(path=DEFAULT_RULES_PATH):
+    """Load an independent validated snapshot, without changing active rules."""
+    return RuleDatabase.load(path, OPERATIONS)
+
+
+def configure_rules(path=DEFAULT_RULES_PATH):
+    """Activate a validated store before loading data/references or serving work.
+
+    For concurrent experiments use load_rule_database + make_canonicaliser's
+    rule_database argument instead of changing the process default.
+    """
+    database = load_rule_database(path)  # validate everything before mutation
+    global RULE_DATABASE, RULES, CLASS_ORDER, SYNSET_TO_CLASS, DEFAULT_SYMMETRY
+    global REFERENCE_CLASSES, REFINE_CLASSES, CLUSTERS_PER_CLASS
+    RULE_DATABASE = database
+    RULES = database.rules
+    CLASS_ORDER = list(database.classes)
+    SYNSET_TO_CLASS = dict(database.synsets)
+    DEFAULT_SYMMETRY = {c: r["symmetry"] for c, r in database.classes.items()}
+    REFERENCE_CLASSES = tuple(c for c in database.classes if database.reference_policy(c).get("enabled", False))
+    REFINE_CLASSES = tuple(c for c in database.classes if database.reference_policy(c).get("refine", False))
+    CLUSTERS_PER_CLASS = {c: database.reference_policy(c)["clusters"] for c in database.classes
+                          if "clusters" in database.reference_policy(c)}
+    return database
+
+
+configure_rules()
 
 
 PCA_FIRST = True        # see canonicalise(); cleared by --no-pca-first
@@ -2500,14 +2180,10 @@ PCA_FIRST = True        # see canonicalise(); cleared by --no-pca-first
 
 def canonical_class_name(cls):
     """Normalise common spelling variants before rule/reference dispatch."""
-    if cls is None:
-        return ""
-    name = cls.strip().lower().replace("-", "_").replace(" ", "_")
-    return {"plane": "airplane", "aeroplane": "airplane",
-            "flowerpot": "flower_pot"}.get(name, name)
+    return RULE_DATABASE.canonical_name(cls)
 
 
-def canonicalise(X, cls):
+def canonicalise(X, cls, *, rule_database=None):
     """Full pipeline for one cloud: label selects the rule, the rule returns a
     canonical rotation and the symmetry group that rotation is defined up to.
 
@@ -2528,13 +2204,14 @@ def canonicalise(X, cls):
     an instance whose cue sits near its decision boundary now falls the same
     side every time instead of wavering, so consistency stops drifting between
     runs at whatever value it already had."""
-    cls = canonical_class_name(cls)
+    database = RULE_DATABASE if rule_database is None else rule_database
+    cls = database.canonical_name(cls)
     pre = np.eye(3)
     if PCA_FIRST:
         pre, _ = pca_baseline(X)
         X = normalise_cloud(X)[0] @ pre.T
     shape = Shape(X)
-    rule = RULES.get(cls, rule_generic)
+    rule = database.rules.get(cls, database.fallback)
     try:
         R, info = rule(shape)
     except Exception as exc:                      # never lose a whole run to one cloud
@@ -2544,7 +2221,7 @@ def canonicalise(X, cls):
     if not is_rotation(R):                        # numerical guard
         U, _, Vt = np.linalg.svd(R)
         R = U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt
-    info.setdefault("symmetry", DEFAULT_SYMMETRY.get(cls, "I"))
+    info.setdefault("symmetry", database.classes.get(cls, {}).get("symmetry", "I"))
     info["ambiguous_axes"] = [name for name in ("forward", "up")
                               if info.get(name + "_confidence", 1.0) < 0.15]
     return R @ pre, info
@@ -3314,6 +2991,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="processed_data", help="root with one folder per class")
+    ap.add_argument("--rules", type=Path, default=DEFAULT_RULES_PATH,
+                    help="JSON rule database (validated before processing clouds)")
     ap.add_argument("--synthetic", action="store_true", help="force procedural shapes")
     ap.add_argument("--instances", type=int, default=25)
     ap.add_argument("--points", type=int, default=1024)
@@ -3338,7 +3017,7 @@ def main():
                     help="skip the principal-axis pre-canonicalisation; the "
                          "rules then see the raw input pose and stability "
                          "measures the rules themselves")
-    ap.add_argument("--reference-classes", default=",".join(REFERENCE_CLASSES),
+    ap.add_argument("--reference-classes", default=None,
                     help="comma-separated classes that get a reference attitude "
                          "('none' to disable)")
     ap.add_argument("--no-refine", action="store_true",
@@ -3357,6 +3036,7 @@ def main():
     ap.add_argument("--out", default=".", help="where to write report, json and figures")
     args = ap.parse_args()
 
+    configure_rules(args.rules)
     PARTIAL_MIRROR = args.partial_mirror
     PCA_FIRST = not args.no_pca_first
     if PCA_FIRST:
@@ -3388,8 +3068,11 @@ def main():
     for cls, (clouds, _) in dataset.items():
         print(f"  {cls:9s} {len(clouds):3d} clouds, {clouds[0].shape[0]} points each")
 
-    chosen = [c.strip() for c in args.reference_classes.split(",") if c.strip()]
-    if chosen and chosen != ["none"]:
+    chosen = (list(REFERENCE_CLASSES) if args.reference_classes is None else
+              [canonical_class_name(c) for c in args.reference_classes.split(",") if c.strip()])
+    if args.reference_classes is None:
+        pass  # keep both reference and refinement selections from the database
+    elif chosen and chosen != ["none"]:
         REFERENCE_CLASSES = tuple(chosen)
         REFINE_CLASSES = tuple(chosen)
     else:
@@ -3473,7 +3156,9 @@ def main():
 
     meta = {"source": "synthetic" if synthetic else str(Path(args.data).resolve()),
             "instances": args.instances, "points": args.points,
-            "rotations": args.rotations, "seed": args.seed}
+            "rotations": args.rotations, "seed": args.seed,
+            "rules_file": str(args.rules.resolve()),
+            "rules_fingerprint": RULE_DATABASE.fingerprint}
     write_report(out_dir / "canonicalisation_report.txt", results, baseline, gt,
                  cls_report, meta, rob)
     (out_dir / "canonicalisation_results.json").write_text(

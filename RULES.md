@@ -1,5 +1,9 @@
 # Orientation rule changes
 
+Class selection and cue recipes are now stored in [`rules.json`](rules.json).
+See [RULE_DATABASE.md](RULE_DATABASE.md) to add a class, compose operations, or
+load another database. The geometric decisions described below are preserved.
+
 The frame remains right-handed: **x forward, y left, z up**. Rules use geometry
 only. Stored dataset pose, file names, and evaluation up axes never enter a
 rule. Unknown labels retain the generic fallback. `plane` and `aeroplane`

@@ -1,0 +1,367 @@
+{
+  "schema_version": 1,
+  "fallback": "generic",
+  "recipes": {
+    "winged": [
+      {
+        "op": "winged"
+      }
+    ],
+    "vehicle": [
+      {
+        "op": "bilateral",
+        "params": {
+          "up_axis": "plate_or_pca",
+          "interior_only": false,
+          "min_frac": 0.1,
+          "plate_cue": "body_plate",
+          "project_up": false,
+          "up_sign": "taper",
+          "forward": "roof_offset"
+        }
+      }
+    ],
+    "seat_back": [
+      {
+        "op": "bilateral",
+        "params": {
+          "plate_cue": "seat_plate",
+          "project_up": false,
+          "up_sign": "top_short"
+        }
+      }
+    ],
+    "platform": [
+      {
+        "op": "platform"
+      }
+    ],
+    "wide_rim": [
+      {
+        "op": "revolution",
+        "params": {
+          "sign_forward": false
+        }
+      }
+    ],
+    "hinged_panels": [
+      {
+        "op": "bilateral"
+      }
+    ],
+    "headboard": [
+      {
+        "op": "bilateral",
+        "params": {
+          "up_sign": "upper_structure",
+          "forward": "crown_vote"
+        }
+      }
+    ],
+    "narrow_neck": [
+      {
+        "op": "revolution",
+        "params": {
+          "wide_end_up": false,
+          "sign_forward": false,
+          "narrow_tie_up": true
+        }
+      }
+    ],
+    "elongated_planar": [
+      {
+        "op": "principal"
+      }
+    ],
+    "wide_back": [
+      {
+        "op": "bilateral",
+        "params": {
+          "lateral": "principal",
+          "up_axis": "support",
+          "crown_pct": 72
+        }
+      }
+    ],
+    "open_basin": [
+      {
+        "op": "open_basin"
+      }
+    ],
+    "seat_optional_back": [
+      {
+        "op": "upright",
+        "params": {
+          "up_axis": "sharpest"
+        }
+      },
+      {
+        "op": "crown_forward"
+      },
+      {
+        "op": "axial_symmetry",
+        "params": {
+          "allow": [
+            "C2z"
+          ],
+          "min_score": 0.65
+        }
+      }
+    ],
+    "closed_base_box": [
+      {
+        "op": "upright",
+        "params": {
+          "up_axis": "principal",
+          "up_sign": "base",
+          "flip_symmetry": true
+        }
+      }
+    ],
+    "flat_panel": [
+      {
+        "op": "slab",
+        "params": {
+          "up_sign": "floor"
+        }
+      },
+      {
+        "op": "panel_symmetry",
+        "params": {
+          "min_score": 0.75
+        }
+      }
+    ],
+    "wide_top_axial": [
+      {
+        "op": "revolution"
+      }
+    ],
+    "wide_top_upright": [
+      {
+        "op": "upright",
+        "params": {
+          "up_axis": "principal",
+          "up_sign": "wide_up"
+        }
+      }
+    ],
+    "supported_case": [
+      {
+        "op": "supported_case"
+      }
+    ],
+    "profile_box": [
+      {
+        "op": "profile_box"
+      }
+    ],
+    "narrow_top_axial": [
+      {
+        "op": "revolution",
+        "params": {
+          "wide_end_up": false
+        }
+      }
+    ],
+    "closed_base_vessel": [
+      {
+        "op": "revolution"
+      },
+      {
+        "op": "end_closure",
+        "params": {
+          "min_score": 0.65
+        }
+      }
+    ],
+    "generic": [
+      {
+        "op": "generic"
+      }
+    ]
+  },
+  "classes": [
+    {
+      "name": "airplane",
+      "recipe": "winged",
+      "symmetry": "I",
+      "synset": "02691156",
+      "aliases": [
+        "plane",
+        "aeroplane"
+      ],
+      "reference": {
+        "enabled": true,
+        "refine": true,
+        "preserve_semantics": true,
+        "lock_confidence": 0.35,
+        "min_improvement": 0.03
+      }
+    },
+    {
+      "name": "car",
+      "recipe": "vehicle",
+      "symmetry": "I",
+      "synset": "02958343",
+      "reference": {
+        "enabled": true,
+        "refine": true,
+        "clusters": 4
+      }
+    },
+    {
+      "name": "chair",
+      "recipe": "seat_back",
+      "symmetry": "I",
+      "synset": "03001627",
+      "reference": {
+        "enabled": true,
+        "refine": true,
+        "clusters": 4
+      }
+    },
+    {
+      "name": "table",
+      "recipe": "platform",
+      "symmetry": "C2z",
+      "synset": "04379243"
+    },
+    {
+      "name": "bowl",
+      "recipe": "wide_rim",
+      "symmetry": "Cinfz",
+      "synset": "02880940"
+    },
+    {
+      "name": "laptop",
+      "recipe": "hinged_panels",
+      "symmetry": "I",
+      "synset": "03642806"
+    },
+    {
+      "name": "bed",
+      "recipe": "headboard",
+      "symmetry": "I",
+      "synset": "02818832",
+      "reference": {
+        "enabled": true,
+        "refine": true
+      }
+    },
+    {
+      "name": "bottle",
+      "recipe": "narrow_neck",
+      "symmetry": "Cinfz",
+      "synset": "02876657"
+    },
+    {
+      "name": "guitar",
+      "recipe": "elongated_planar",
+      "symmetry": "I",
+      "synset": "03467517"
+    },
+    {
+      "name": "sofa",
+      "recipe": "wide_back",
+      "symmetry": "I",
+      "synset": "04256520"
+    },
+    {
+      "name": "bathtub",
+      "recipe": "open_basin",
+      "symmetry": "I",
+      "synset": "02808440",
+      "reference": {
+        "enabled": true,
+        "refine": true,
+        "recheck_symmetry": {
+          "allow": [
+            "C2z"
+          ],
+          "min_score": 0.65
+        }
+      }
+    },
+    {
+      "name": "bench",
+      "recipe": "seat_optional_back",
+      "symmetry": "I",
+      "synset": "02828884"
+    },
+    {
+      "name": "bookshelf",
+      "recipe": "closed_base_box",
+      "symmetry": "I",
+      "synset": "02871439"
+    },
+    {
+      "name": "door",
+      "recipe": "flat_panel",
+      "symmetry": "C2z"
+    },
+    {
+      "name": "flower_pot",
+      "recipe": "wide_top_axial",
+      "symmetry": "Cinfz",
+      "synset": "03991062",
+      "aliases": [
+        "flowerpot"
+      ]
+    },
+    {
+      "name": "keyboard",
+      "recipe": "flat_panel",
+      "symmetry": "C2z",
+      "synset": "03085013"
+    },
+    {
+      "name": "lamp",
+      "recipe": "wide_top_axial",
+      "symmetry": "Cinfz",
+      "synset": "03636649"
+    },
+    {
+      "name": "monitor",
+      "recipe": "wide_top_upright",
+      "symmetry": "I",
+      "synset": "03211117"
+    },
+    {
+      "name": "piano",
+      "recipe": "supported_case",
+      "symmetry": "I",
+      "synset": "03928116"
+    },
+    {
+      "name": "toilet",
+      "recipe": "profile_box",
+      "symmetry": "I"
+    },
+    {
+      "name": "wardrobe",
+      "recipe": "closed_base_box",
+      "symmetry": "I"
+    },
+    {
+      "name": "cone",
+      "recipe": "narrow_top_axial",
+      "symmetry": "Cinfz"
+    },
+    {
+      "name": "sink",
+      "recipe": "open_basin",
+      "symmetry": "I"
+    },
+    {
+      "name": "stool",
+      "recipe": "platform",
+      "symmetry": "I"
+    },
+    {
+      "name": "vase",
+      "recipe": "closed_base_vessel",
+      "symmetry": "Cinfz"
+    }
+  ]
+}

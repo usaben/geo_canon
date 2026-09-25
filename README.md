@@ -48,6 +48,14 @@ always pick the class from the dropdown yourself.
 
 ---
 
+## Rule database
+
+Class rules now live in [`rules.json`](rules.json). Add classes by selecting or
+composing recipes from reusable geometric operations; no per-class Python
+function is needed. All three CLIs accept `--rules path/to/rules.json`.
+See [the database guide](RULE_DATABASE.md) for examples, validation, reference
+policies, and migration checks.
+
 ## Data
 
 ```
