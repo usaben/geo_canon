@@ -44,9 +44,11 @@ from scipy.spatial import cKDTree
 if __package__:
     from .rule_database import Operation, RuleDatabase
     from .support_cues import surface_evidence
+    from .part_cues import part_check
 else:  # direct script execution, as used by the demo and CLI
     from rule_database import Operation, RuleDatabase
     from support_cues import surface_evidence
+    from part_cues import part_check
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -2567,6 +2569,7 @@ OPERATIONS = {
     "cabinet_face": Operation(cabinet_face, modifier=True, choices={
         "metric": ("mass", "area", "occupancy", "central", "planarity", "closure"),
         "front": ("sparse", "dense")}),
+    "part_check": Operation(part_check, modifier=True),
 }
 DEFAULT_RULES_PATH = Path(__file__).with_name("rules.json")
 
