@@ -108,13 +108,56 @@
         }
       }
     ],
-    "closed_base_box": [
+    "cabinet_balanced": [
       {
         "op": "upright",
         "params": {
           "up_axis": "principal",
           "up_sign": "base",
-          "flip_symmetry": true
+          "flip_symmetry": false
+        }
+      },
+      {
+        "op": "box_axes",
+        "params": {
+          "depth_quantile": 0.01,
+          "min_depth_separation": 0.08,
+          "min_up_alignment": 0.5
+        }
+      },
+      {
+        "op": "support_base",
+        "params": {
+          "mode": "flat_base",
+          "forward_policy": "preserve",
+          "crown_pct": 72,
+          "contact_frac": 0.04,
+          "lower_frac": 0.3,
+          "max_lower_mass": 0.35,
+          "min_points": 10,
+          "score_threshold": 0.3,
+          "margin_threshold": 0.2,
+          "axis_search": "sign",
+          "symmetry_allow": [
+            "I"
+          ]
+        }
+      },
+      {
+        "op": "cabinet_face",
+        "params": {
+          "metric": "closure",
+          "front": "sparse",
+          "end_frac": 0.08,
+          "min_points": 8,
+          "margin_threshold": 0.08
+        }
+      },
+      {
+        "op": "box_symmetry",
+        "params": {
+          "min_score": 0.75,
+          "relative_factor": 1.3
         }
       }
     ],
@@ -431,34 +474,6 @@
         }
       }
     ],
-    "wardrobe_supported": [
-      {
-        "op": "upright",
-        "params": {
-          "up_axis": "principal",
-          "up_sign": "base",
-          "flip_symmetry": true
-        }
-      },
-      {
-        "op": "support_base",
-        "params": {
-          "mode": "flat_base",
-          "forward_policy": "preserve",
-          "crown_pct": 72,
-          "contact_frac": 0.04,
-          "lower_frac": 0.3,
-          "max_lower_mass": 0.35,
-          "min_points": 10,
-          "score_threshold": 0.3,
-          "margin_threshold": 0.2,
-          "axis_search": "sign",
-          "symmetry_allow": [
-            "I"
-          ]
-        }
-      }
-    ],
     "flower_pot_supported": [
       {
         "op": "revolution"
@@ -593,7 +608,7 @@
     },
     {
       "name": "bookshelf",
-      "recipe": "closed_base_box",
+      "recipe": "cabinet_balanced",
       "symmetry": "I",
       "synset": "02871439"
     },
@@ -642,7 +657,7 @@
     },
     {
       "name": "wardrobe",
-      "recipe": "wardrobe_supported",
+      "recipe": "cabinet_balanced",
       "symmetry": "I"
     },
     {

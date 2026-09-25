@@ -70,7 +70,7 @@ PARTIAL_MIRROR = False  # let the mirror plane leave the centroid.  Correct for
                         # map one wing of an aircraft onto the other -- so it is
                         # off by default and exposed as --partial-mirror
 EPS = 1e-12
-RULESET_VERSION = 3
+RULESET_VERSION = 4
 
 
 # ----------------------------------------------------------------------------
@@ -1692,6 +1692,152 @@ def support_base(shape, R, info, mode="either", contact_frac=0.04,
     return frame_from(forward, up), metadata
 
 
+def box_axes(shape, R, info, depth_quantile=0.01,
+             min_depth_separation=0.08, min_up_alignment=0.50):
+    """Anchor a box-like object's front axis to its thinnest dimension.
+
+    Cabinets, shelves and appliances often have several plausible mirror
+    planes.  A mirror cue can consequently exchange width and depth even when
+    it has already found the vertical axis correctly.  This modifier keeps the
+    incoming vertical choice, snaps it to the closest principal axis, and uses
+    the shortest robust principal extent for depth.  It abstains for near-cubic
+    shapes and whenever doing so would replace rather than refine the incoming
+    vertical estimate.
+
+    Principal axes are unsigned.  Their signs are inherited from the incoming
+    frame here and can subsequently be resolved by ``support_base`` and
+    ``cabinet_face``.  Any symmetry attached to the old axis assignment is
+    cleared; a later measured-symmetry operation may add it back.
+    """
+    axes = [unit(shape.V[:, i]) for i in range(3)]
+    q0, q1 = depth_quantile, 1.0 - depth_quantile
+    spans = np.array([float(np.diff(np.quantile(shape.X @ axis, [q0, q1]))[0])
+                      for axis in axes])
+    order = np.argsort(spans)
+    depth_index = int(order[0])
+    separation = float((spans[order[1]] - spans[order[0]]) /
+                       max(spans[order[1]], EPS))
+    other_eigenvalue = min(float(shape.w[i]) for i in range(3) if i != depth_index)
+    spectral_separation = float((other_eigenvalue - shape.w[depth_index]) /
+                                max(other_eigenvalue, EPS))
+    metadata = dict(info, box_axis_applied=False,
+                    box_axis_spans=spans.tolist(),
+                    box_depth_separation=separation,
+                    box_depth_spectral_separation=spectral_separation)
+    if min(separation, spectral_separation) < min_depth_separation:
+        return R, dict(metadata, box_axis_reason="ambiguous_depth")
+
+    remaining = [i for i in range(3) if i != depth_index]
+    up_index = max(remaining, key=lambda i: abs(float(axes[i] @ R[2])))
+    up_alignment = abs(float(axes[up_index] @ R[2]))
+    metadata["box_up_alignment"] = up_alignment
+    if up_alignment < min_up_alignment:
+        return R, dict(metadata, box_axis_reason="conflicts_with_incoming_up")
+
+    up = axes[up_index]
+    if up @ R[2] < 0:
+        up = -up
+    forward = axes[depth_index]
+    forward_alignment = float(forward @ R[0])
+    if abs(forward_alignment) >= 0.50:
+        if forward_alignment < 0:
+            forward = -forward
+        sign_cue = "incoming_forward"
+    else:
+        # The incoming frame sometimes called the cabinet width "forward".
+        # Its dot product with the true depth is then numerical zero, whose
+        # sign can change after a harmless input rotation.  A third moment is
+        # an equivariant, geometry-derived fallback until cabinet_face gets a
+        # chance to use the terminal surfaces themselves.
+        if float(np.mean((shape.X @ forward) ** 3)) < 0:
+            forward = -forward
+        sign_cue = "depth_third_moment"
+    return frame_from(forward, up), dict(
+        metadata, box_axis_applied=True, box_axis_reason="thin_dimension",
+        box_depth_axis=depth_index, box_up_axis=up_index,
+        box_forward_sign_cue=sign_cue, forward_cue="thin_dimension",
+        symmetry="I")
+
+
+def _cabinet_face_statistics(X, axis, end_frac, min_points):
+    """Return comparable surface statistics for the two depth end bands."""
+    from scipy.spatial import ConvexHull, QhullError
+
+    axis = unit(axis)
+    depth = X @ axis
+    lo, hi = np.quantile(depth, [0.01, 0.99])
+    span = max(float(hi - lo), EPS)
+    a, b = complement(axis)
+    projection = np.column_stack([X @ a, X @ b])
+    bounds = np.quantile(projection, [0.01, 0.99], axis=0)
+    size = np.maximum(bounds[1] - bounds[0], EPS)
+    footprint_area = max(float(np.prod(size)), EPS)
+    centre = bounds.mean(0)
+    result = []
+    for sign, mask, extreme in ((-1, depth <= lo + end_frac * span, lo),
+                                (1, depth >= hi - end_frac * span, hi)):
+        points = projection[mask]
+        if len(points) < min_points:
+            result.append({"sign": sign, "points": int(len(points)),
+                           "mass": 0.0, "area": 0.0, "occupancy": 0.0,
+                           "central": 0.0, "planarity": 0.0,
+                           "closure": 0.0})
+            continue
+        try:
+            area = float(ConvexHull(points).volume) / footprint_area
+        except QhullError:
+            area = 0.0
+        cells = 10
+        indices = np.floor((points - bounds[0]) / size * (cells - 1e-9)).astype(int)
+        valid = np.all((indices >= 0) & (indices < cells), axis=1)
+        occupancy = (len(set(map(tuple, indices[valid].tolist()))) /
+                     float(cells * cells))
+        normalised = np.abs((points - centre) / size)
+        central = float(np.mean(np.max(normalised, axis=1) < 0.22))
+        planarity = float(np.mean(np.abs(depth[mask] - extreme) <
+                                  0.20 * end_frac * span))
+        mass = float(np.mean(mask))
+        closure = float(mass * math.sqrt(max(area, 0.0)) * planarity)
+        result.append({"sign": sign, "points": int(len(points)),
+                       "mass": mass, "area": area,
+                       "occupancy": occupancy, "central": central,
+                       "planarity": planarity, "closure": closure})
+    return result
+
+
+def cabinet_face(shape, R, info, metric="mass", front="sparse",
+                 end_frac=0.08, min_points=8, margin_threshold=0.08):
+    """Resolve front/back from the two faces of a box-like object.
+
+    Open shelves tend to have fewer samples at the open face than at their
+    back panel; wardrobes often expose a smaller terminal footprint at their
+    detailed door face than at the plain rear panel.  Recipes select the
+    statistic that matches the representation.  A normalised difference is
+    required before the incoming sign is changed, so a closed symmetric box
+    remains explicitly ambiguous instead of receiving a sampling-noise label.
+    """
+    faces = _cabinet_face_statistics(shape.X, R[0], end_frac, min_points)
+    values = [float(face[metric]) for face in faces]
+    margin = abs(values[1] - values[0]) / max(values[1] + values[0], EPS)
+    metadata = dict(info, cabinet_face_applied=False,
+                    cabinet_face_metric=metric, cabinet_face_front=front,
+                    cabinet_face_margin=float(margin), cabinet_faces=faces)
+    if min(face["points"] for face in faces) < min_points:
+        return R, dict(metadata, cabinet_face_reason="insufficient_points",
+                       forward_confidence=0.0)
+    if margin < margin_threshold:
+        return R, dict(metadata, cabinet_face_reason="ambiguous_faces",
+                       forward_confidence=float(margin))
+
+    index = int(np.argmin(values) if front == "sparse" else np.argmax(values))
+    forward = faces[index]["sign"] * R[0]
+    return frame_from(forward, R[2]), dict(
+        metadata, cabinet_face_applied=True,
+        cabinet_face_reason="distinct_terminal_faces",
+        forward_cue=f"cabinet_{front}_{metric}",
+        forward_confidence=float(margin))
+
+
 def revolution_frame(shape, wide_end_up=True, sign_forward=True,
                      narrow_tie_up=False, end_frac=0.22):
     """A surface of revolution: the axis carries everything, the azimuth is
@@ -1796,6 +1942,38 @@ def panel_symmetry(shape, R, info, min_score=0.75):
     else:
         symmetry = "I"
     return R, dict(info, symmetry=symmetry, half_turn_scores=scores)
+
+
+def box_symmetry(shape, R, info, min_score=0.75, relative_factor=1.30):
+    """Measure the proper half-turns of a box-like instance.
+
+    Dense, featureless boxes use the same absolute match requirement as panel
+    symmetry.  Sparse shelves can have a lower absolute score even for their
+    true top/bottom flip, so each half-turn is also compared with generic
+    rotations about that same axis.  This recovers an ambiguity only when the
+    half-turn is distinctly more self-similar than unrelated angles.
+    """
+    scores, baselines, valid = [], [], []
+    for axis in R:
+        score = float(shape.rot_score(axis, angles=(np.pi,)))
+        generic = float(np.mean([shape.rot_score(axis, angles=(angle,))
+                                 for angle in (0.77, 1.31, 2.21)]))
+        scores.append(score)
+        baselines.append(generic)
+        valid.append(score >= min_score or score >= relative_factor * generic)
+    if all(valid):
+        symmetry = "D2"
+    elif valid[2]:
+        symmetry = "C2z"
+    elif valid[0]:
+        symmetry = "C2x"
+    elif valid[1]:
+        symmetry = "C2y"
+    else:
+        symmetry = "I"
+    return R, dict(info, symmetry=symmetry, half_turn_scores=scores,
+                   half_turn_baselines=baselines,
+                   half_turn_valid=[bool(value) for value in valid])
 
 
 def supported_case_frame(shape):
@@ -2376,6 +2554,7 @@ OPERATIONS = {
     "axial_symmetry": Operation(axial_symmetry, modifier=True,
                                 choices={"allow": ("C2z", "C4z", "Cinfz")}),
     "panel_symmetry": Operation(panel_symmetry, modifier=True),
+    "box_symmetry": Operation(box_symmetry, modifier=True),
     "end_closure": Operation(end_closure, modifier=True),
     "panel_on_support": Operation(panel_on_support, modifier=True,
                                    choices={"forward_policy": ("preserve", "crown", "density")}),
@@ -2384,6 +2563,10 @@ OPERATIONS = {
         "axis_search": ("sign", "principal", "planes"),
         "symmetry_allow": ("I", "C2z", "C4z", "Cinfz"),
         "forward_policy": ("preserve", "crown", "crown_vote")}),
+    "box_axes": Operation(box_axes, modifier=True),
+    "cabinet_face": Operation(cabinet_face, modifier=True, choices={
+        "metric": ("mass", "area", "occupancy", "central", "planarity", "closure"),
+        "front": ("sparse", "dense")}),
 }
 DEFAULT_RULES_PATH = Path(__file__).with_name("rules.json")
 

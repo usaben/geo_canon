@@ -78,9 +78,14 @@ class Operation:
                 _check(0 <= value <= 100, f"{where}.{key}: must be in [0, 100]")
             if key.endswith(("_frac", "_score", "_threshold")):
                 _check(0 <= value <= 1, f"{where}.{key}: must be in [0, 1]")
-            if key in ("panel_frac", "slab_frac", "stem_width_ratio", "contact_frac", "lower_frac", "max_lower_mass"):
+            if key in ("panel_frac", "slab_frac", "stem_width_ratio", "contact_frac",
+                       "lower_frac", "max_lower_mass", "end_frac"):
                 _check(type(value) in (int, float) and 0 < value < 1,
                        f"{where}.{key}: must be in (0, 1)")
+            if key == "depth_quantile":
+                _check(0 < value < 0.5, f"{where}.{key}: must be in (0, 0.5)")
+            if key in ("min_depth_separation", "min_up_alignment"):
+                _check(0 <= value <= 1, f"{where}.{key}: must be in [0, 1]")
             if key == "base_expansion":
                 _check(value > 1, f"{where}.{key}: must exceed 1")
             if key == "min_points":
