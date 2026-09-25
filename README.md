@@ -281,42 +281,66 @@ all predate the current rules, including the up-sign fixes to car and chair.
 
 ---
 
-## Quick: just produce the report files
+## Quick: clone, build, test both new versions
 
-Clone, create the environment, run. The data (`processed_data/`) and the Uni3D
-files come with the clone; the part model's weights (89 MB) download on the
-first run, so it needs internet once.
+Everything needed comes with the clone: the data (`processed_data/`) and the
+Uni3D files. The part model's weights (89 MB) and the vision model download
+on first use, so the first run needs internet. The vision model needs a GPU
+with about 17 GB free.
 
 ```bash
-# 1. get the code
+# ---- 1. get the code -------------------------------------------------------
 git clone https://github.com/usaben/geo_canon.git
 cd geo_canon
 git checkout local_llm_integration
 
-# 2. create the environment (once)
+# ---- 2. build the two environments (once) ---------------------------------
 conda create -n geocanon python=3.10 -y
 conda activate geocanon
 pip install -r requirements.txt
 
-# 3. reports -- same format as results_newb.txt
-# plain rules (the newb baseline)
+conda create -n vllm python=3.11 -y
+conda activate vllm
+pip install vllm
+
+# ---- 3. start the vision-model server in the background -------------------
+conda activate vllm
+nohup vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000 --max-model-len 8192 > vllm.log 2>&1 &
+until curl -s localhost:8000/v1/models > /dev/null; do sleep 10; done; echo "vLLM ready"
+
+# ---- 4. the reports (same format as results_newb.txt) ---------------------
+conda activate geocanon
+export GEOCANON_VLM_URL=http://localhost:8000/v1
+export GEOCANON_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+
+# a) old rules (the newb baseline)
 python class_report.py --instances 100 --rotations 6 --refs none --no-figures \
     --out report_newb.txt --simple-out report_newb_simple.txt
 
-# new model: rules + part check
+# b) new model 1: rules + part check (PatchAlign3D, CPU)
 python class_report.py --rules rules_parts.json --instances 100 --rotations 6 --refs none \
     --no-figures --out report_parts.txt --simple-out report_parts_simple.txt
 
-# compare
-diff report_newb.txt report_parts.txt
-```
-
-Optional, with the vision model (needs a GPU). Run steps 3–5 of "Step by step"
-above first; they start the vLLM server and create `rules_vlm.json`. Then:
-
-```bash
-export GEOCANON_VLM_URL=http://localhost:8000/v1
-export GEOCANON_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+# c) new model 2: rules + part check + vision model (vLLM)
+#    pilot on both halves, then switch the check on only where it helped on both
+python vlm_pilot.py --rules rules_parts.json --half A --out pilot_A.json
+python vlm_pilot.py --rules rules_parts.json --half B --out pilot_B.json
+python vlm_select.py pilot_A.json pilot_B.json --base rules_parts.json --out rules_vlm.json
 python class_report.py --rules rules_vlm.json --instances 100 --rotations 6 --refs none \
     --no-figures --out report_vlm.txt --simple-out report_vlm_simple.txt
+
+# ---- 5. compare --------------------------------------------------------------
+diff report_newb.txt report_parts.txt
+diff report_newb.txt report_vlm.txt
+
+# ---- 6. stop the server when done --------------------------------------------
+kill %1
 ```
+
+Notes:
+- **`vlm_select.py`** prints which classes got the vision check. If none
+  qualified, `rules_vlm.json` equals `rules_parts.json` and the two reports
+  match.
+- **If the vLLM server is not running,** step c still finishes, but the vision
+  check falls back to the rules, so `report_vlm.txt` equals `report_parts.txt`.
+- **No GPU:** run only 4a and 4b.
