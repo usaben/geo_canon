@@ -272,6 +272,11 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/index":
             return self._send({c: ids for c, (_, ids) in STATE["data"].items()})
 
+        if url.path == "/api/predictable":
+            # the classes 'auto' can actually name: the centroid file's when Uni3D
+            # is loaded, otherwise every loaded class
+            return self._send({"classes": STATE.get("cent_classes") or list(STATE["data"])})
+
         if url.path == "/api/cloud":
             cls = q.get("cls", [""])[0]
             idx = int(q.get("idx", ["0"])[0])
@@ -566,7 +571,7 @@ PAGE = r"""<!doctype html>
     <button id="rand">random poses</button>
     <button id="reset">reset</button>
     <button id="addcloud">add cloud</button>
-    <input id="cloudfile" type="file" accept=".pt,.npy,.npz,.obj,.ply" hidden>
+    <input id="cloudfile" type="file" accept=".pt,.npy,.npz,.obj,.ply" multiple hidden>
   </div>
   <span id="status"><i></i>canonicalising…</span>
 </header>
@@ -783,7 +788,12 @@ function randRot(){
   return new THREE.Matrix4().makeRotationFromQuaternion(q);
 }
 
-let INDEX={};
+let INDEX={}, PREDICTABLE=[];
+function shuffled(a){
+  a=a.slice();
+  for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; }
+  return a;
+}
 async function loadObjects(){
   S.items=[];
   const classes=Object.keys(INDEX);
@@ -791,7 +801,13 @@ async function loadObjects(){
 
   const targetClasses=[];
   if(S.cls==="all" || S.cls==="auto"){
-    for(let i=0;i<S.n;i++) targetClasses.push(classes[i%classes.length]);
+    // a random draw of distinct classes, reshuffled once the pool runs out, so
+    // "show 10" is not always the first ten alphabetically.  auto only draws
+    // from classes Uni3D can name, or it would be set up to fail.
+    let pool=classes;
+    if(S.cls==="auto" && PREDICTABLE.length) pool=classes.filter(c=>PREDICTABLE.includes(c));
+    let bag=[];
+    for(let i=0;i<S.n;i++){ if(!bag.length) bag=shuffled(pool); targetClasses.push(bag.pop()); }
   }else{
     for(let i=0;i<S.n;i++) targetClasses.push(S.cls);
   }
@@ -854,15 +870,15 @@ async function go(){
           // internals of that choice and stay off the screen
           S.items[i].pred=r.predicted_cls||null;
           S.items[i].predConf=r.predicted_conf;
-          S.items[i].tag=r.predicted_cls
-            || r.symmetry+(r.cluster==null?"":` · c${r.cluster}`);
+          // with a class picked by hand there is nothing predicted, so no chip
+          S.items[i].tag=r.predicted_cls||"";
         }
       });
       overlay(); render();
       document.getElementById("barB").innerHTML=
         `<span class="k">${d.per} ms</span> per cloud<span class="sep">·</span>`+
-        `<span class="k">${d.ms} ms</span> total<span class="sep">·</span>`+
-        `chips show the predicted category`;
+        `<span class="k">${d.ms} ms</span> total`+
+        (S.cls==="auto"?`<span class="sep">·</span>chips show the predicted category`:``);
     }
   }catch(e){document.getElementById("barB").textContent=String(e);}
   busy(false); S.busy=false;
@@ -899,19 +915,40 @@ const addBtn=document.getElementById("addcloud");
 const addFile=document.getElementById("cloudfile");
 addBtn.onclick=()=>addFile.click();
 addFile.onchange=()=>{
-  const f=addFile.files[0]; if(!f) return;
+  const fs=[...addFile.files];
   addFile.value="";
-  doUpload(f);
+  uploadMany(fs);
 };
-async function doUpload(f){
+// several files at once, from the picker or dropped anywhere on the page; they
+// go up one by one and the canonicaliser runs once at the end
+const OK_EXT=/\.(pt|npy|npz|obj|ply)$/i;
+addEventListener('dragover',e=>e.preventDefault());
+addEventListener('drop',e=>{
+  e.preventDefault();
+  uploadMany([...(e.dataTransfer?.files||[])].filter(f=>OK_EXT.test(f.name)));
+});
+async function uploadMany(fs){
+  if(!fs.length) return;
+  if(fs.length===1){ await doUpload(fs[0]); return; }
   const bar=document.getElementById("barB");
-  busy(true); bar.textContent=`reading ${f.name}`;
+  let ok=0;
+  for(let i=0;i<fs.length;i++){
+    bar.textContent=`reading ${fs[i].name} (${i+1} of ${fs.length})`;
+    if(await doUpload(fs[i],false)) ok++;
+  }
+  overlay(); render(); go();
+  bar.textContent=`added ${ok} of ${fs.length} file(s)`+
+    (fs.length>MAXN?` - only the newest ${MAXN} are shown`:``)+` - drag one to check the frame holds`;
+}
+async function doUpload(f,finish=true){
+  const bar=document.getElementById("barB");
+  busy(true); if(finish) bar.textContent=`reading ${f.name}`;
   try{
     const r=await fetch(`/api/upload?cls=${encodeURIComponent(S.cls)}`+
                         `&name=${encodeURIComponent(f.name)}`,
                         {method:"POST",body:f});
     const d=await r.json();
-    if(d.error){ bar.textContent="upload failed: "+d.error; busy(false); return; }
+    if(d.error){ bar.textContent=`upload failed (${f.name}): `+d.error; busy(false); return false; }
     INDEX=await (await fetch("/api/index")).json();
     const c=await (await fetch(`/api/cloud?cls=${d.cls}&idx=${d.idx}`)).json();
     const a=scene(c.points,false), b=scene(c.points,true);
@@ -920,6 +957,7 @@ async function doUpload(f){
     setRot(it.gA,it.W); setRot(it.gB,new THREE.Matrix4());
     S.items.unshift(it);                      // newest first, so it is visible
     if(S.items.length>MAXN) S.items.length=MAXN;
+    if(!finish){ busy(false); return true; }
     overlay(); render(); go();
     let msg=`${d.id}: ${d.n} points, ${d.mask}`;
     if(d.predicted_by){
@@ -930,8 +968,9 @@ async function doUpload(f){
         msg+=` - low confidence; set the class if it looks wrong`;
     }
     bar.textContent=msg+` - drag it to check the frame holds`;
-  }catch(e){ bar.textContent="upload failed: "+e; }
+  }catch(e){ bar.textContent=`upload failed (${f.name}): `+e; busy(false); return false; }
   busy(false);
+  return true;
 }
 
 document.getElementById("pick").onclick=loadObjects;
@@ -942,6 +981,7 @@ document.getElementById("reset").onclick=()=>{ S.items.forEach(it=>{
 
 (async function(){
   INDEX=await (await fetch("/api/index")).json();
+  PREDICTABLE=(await (await fetch("/api/predictable")).json()).classes||[];
   const cs=document.getElementById("cls");
 
   const autoOpt=document.createElement("option");
